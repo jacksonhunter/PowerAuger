@@ -24,8 +24,33 @@ PowerAuger is in **active development** with production-grade features and exper
 
 **Current Development Phase:**
 - 🔧 JSON-first reliability improvements
-- 🔧 SSH tunnel robustness enhancements
+- 🔧 SSH tunnel robustness enhancements (PowerAuger.psm1:186-394)
 - 🔧 Performance optimization and refinements
+
+### Feature Fork: OllamaTunnelMonitor (v1.0.0 - 2025)
+**Parallel Development Track** - Standalone tunnel monitoring and management system
+
+**Development Approach:**
+- **Feature Fork Strategy**: Independent module development for focused tunnel management
+- **PowerAuger Integration**: Compatible but standalone - can import PowerAuger config automatically
+- **Separation of Concerns**: Monitoring/infrastructure vs prediction/AI functionality
+- **Safe Development**: Changes don't affect core PowerAuger prediction reliability
+
+**OllamaTunnelMonitor Released Features:**
+- ✅ .NET socket-based connectivity testing (System.Net.Sockets integration)
+- ✅ Real-time interactive dashboard with live metrics
+- ✅ Headless monitoring daemon for background operation
+- ✅ PowerAuger configuration auto-import
+- ✅ Windows-optimized process management and cleanup
+- ✅ Comprehensive tunnel and Ollama server health checks
+- ✅ Background job monitoring for Continue IDE integration
+- ✅ Modular architecture with independent versioning
+
+**Integration Timeline:**
+- **Phase 1 (Completed)**: Enhanced SSH tunnel management in PowerAuger (background processes, PID tracking, Windows shutdown handling)
+- **Phase 2 (In Progress)**: Standalone OllamaTunnelMonitor module development
+- **Phase 3 (Planned)**: Optional tight integration with shared state and metrics
+- **Phase 4 (Future)**: Windows service option for system-level tunnel persistence
 
 ### Roadmap
 
@@ -50,6 +75,11 @@ PowerAuger is in **active development** with production-grade features and exper
 - `modules/PowerAuger/PowerAuger.psm1` - Main prediction engine (3000+ lines) with intelligent caching, context awareness, and acceptance tracking
 - `modules/PowerAuger/PowerAuger.psd1` - Module manifest (v3.4.0) with comprehensive function exports and PSReadLine integration
 - `modules/PowerAuger/setup.ps1` - Interactive setup script with auto-configuration, model detection, and profile integration
+
+### OllamaTunnelMonitor Module (Feature Fork)
+- `modules/OllamaTunnelMonitor/OllamaTunnelMonitor.psm1` - Standalone tunnel monitoring engine with .NET socket integration
+- `modules/OllamaTunnelMonitor/OllamaTunnelMonitor.psd1` - Module manifest (v1.0.0) with monitoring and dashboard functions
+- **Key Features**: Real-time dashboard, headless monitoring, PowerAuger config auto-import, Windows process management
 
 ### Ollama Model Definitions
 - `modelfiles/PowerShell-Fast.Modelfile` - Ultra-fast completion (qwen3:4b-q4_K_M, <300ms target)

@@ -183,6 +183,79 @@ function Save-PowerAugerConfiguration {
 # SSH TUNNEL MANAGEMENT
 # --------------------------------------------------------------------------------------------------------
 
+function Find-SSHTunnelProcess {
+    [CmdletBinding()]
+    param(
+        [int]$LocalPort,
+        [string]$RemoteHost
+    )
+    
+    try {
+        # Method 1: Use .NET TcpConnectionInformation to find listening processes
+        $tcpConnections = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        $localEndpoint = $tcpConnections | Where-Object { $_.Port -eq $LocalPort -and $_.Address -eq [System.Net.IPAddress]::Loopback }
+        
+        if ($localEndpoint) {
+            # Method 2: Use netstat to find the PID more reliably
+            $netstatCmd = "netstat -ano"
+            $netstatOutput = & cmd /c $netstatCmd 2>$null
+            
+            foreach ($line in $netstatOutput) {
+                if ($line -match "TCP\s+127\.0\.0\.1:$LocalPort\s+.*\s+LISTENING\s+(\d+)") {
+                    $pid = $matches[1]
+                    
+                    # Verify this is actually an SSH process
+                    try {
+                        $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                        if ($process -and ($process.ProcessName -eq "ssh" -or $process.ProcessName -eq "ssh.exe")) {
+                            if ($global:OllamaConfig.Performance.EnableDebug) {
+                                Write-Host "🔍 Found SSH tunnel process: PID $pid" -ForegroundColor Cyan
+                            }
+                            return [int]$pid
+                        }
+                    }
+                    catch {
+                        # Process might have exited, continue
+                    }
+                }
+            }
+        }
+        
+        # Method 3: Fallback - search all SSH processes and check their network connections
+        $sshProcesses = Get-Process -Name "ssh*" -ErrorAction SilentlyContinue
+        foreach ($proc in $sshProcesses) {
+            try {
+                # Use WMI to get network connections for this process (more reliable than CommandLine)
+                $connections = Get-WmiObject -Class Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+                if ($connections) {
+                    # Check if this process has our port open
+                    $portCheck = netstat -ano | Select-String ":$LocalPort.*LISTENING.*$($proc.Id)"
+                    if ($portCheck) {
+                        if ($global:OllamaConfig.Performance.EnableDebug) {
+                            Write-Host "🔍 Found SSH tunnel via process search: PID $($proc.Id)" -ForegroundColor Cyan
+                        }
+                        return $proc.Id
+                    }
+                }
+            }
+            catch {
+                # Access denied or other error, continue
+            }
+        }
+        
+        if ($global:OllamaConfig.Performance.EnableDebug) {
+            Write-Warning "Could not find SSH tunnel process for port $LocalPort"
+        }
+        return $null
+    }
+    catch {
+        if ($global:OllamaConfig.Performance.EnableDebug) {
+            Write-Warning "Error finding SSH tunnel process: $($_.Exception.Message)"
+        }
+        return $null
+    }
+}
+
 function Start-OllamaTunnel {
     [CmdletBinding()]
     param([switch]$Force)
@@ -199,7 +272,10 @@ function Start-OllamaTunnel {
         }
         
         $sshArgs = @(
-            "-N", "-T", "-C"
+            "-f", "-N", "-T", "-C"
+            "-o", "ExitOnForwardFailure=yes"
+            "-o", "ServerAliveInterval=30"
+            "-o", "ServerAliveCountMax=3"
             "-L", "$($global:OllamaConfig.Server.LocalPort):localhost:$($global:OllamaConfig.Server.LinuxPort)"
         )
         
@@ -209,6 +285,7 @@ function Start-OllamaTunnel {
         
         $sshArgs += "$($global:OllamaConfig.Server.SSHUser)@$($global:OllamaConfig.Server.LinuxHost)"
         
+        # Start SSH with -f flag and track the resulting process
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
         $processInfo.FileName = "ssh"
         $processInfo.Arguments = $sshArgs -join " "
@@ -217,17 +294,23 @@ function Start-OllamaTunnel {
         $processInfo.RedirectStandardError = $true
         
         $process = [System.Diagnostics.Process]::Start($processInfo)
-        Start-Sleep -Seconds 2
+        $process.WaitForExit() # With -f, this should exit immediately after forking
+        Start-Sleep -Seconds 3 # Give the background process time to establish the tunnel
+        
+        # Find the actual SSH tunnel process using more reliable method
+        $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
         
         # Test connection
         $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
         
         if ($testResponse) {
-            $global:OllamaConfig.Server.TunnelProcess = $process
+            # Store the tunnel process info for later cleanup
+            $global:OllamaConfig.Server.TunnelProcessId = $tunnelPid
+            $global:OllamaConfig.Server.TunnelProcess = $null # We don't have a direct handle
             $global:OllamaConfig.Server.IsConnected = $true
             
             if ($global:OllamaConfig.Performance.EnableDebug) {
-                Write-Host "✅ SSH tunnel established" -ForegroundColor Green
+                Write-Host "✅ SSH tunnel established in background (PID: $tunnelPid)" -ForegroundColor Green
             }
             return $true
         }
@@ -244,17 +327,69 @@ function Stop-OllamaTunnel {
     [CmdletBinding()]
     param([switch]$Silent)
     
+    $tunnelStopped = $false
+    
+    # Method 1: Use stored PID if available
+    if ($global:OllamaConfig.Server.TunnelProcessId) {
+        try {
+            $process = Get-Process -Id $global:OllamaConfig.Server.TunnelProcessId -ErrorAction SilentlyContinue
+            if ($process) {
+                $process.Kill()
+                $tunnelStopped = $true
+                if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "🔗 Killed SSH tunnel process (PID: $($global:OllamaConfig.Server.TunnelProcessId))" -ForegroundColor Yellow
+                }
+            }
+        }
+        catch {
+            if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
+                Write-Warning "Could not kill stored tunnel process: $($_.Exception.Message)"
+            }
+        }
+        $global:OllamaConfig.Server.TunnelProcessId = $null
+    }
+    
+    # Method 2: Fallback to finding the process (legacy support)
+    if (-not $tunnelStopped) {
+        $foundPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
+        if ($foundPid) {
+            try {
+                $process = Get-Process -Id $foundPid -ErrorAction SilentlyContinue
+                if ($process) {
+                    $process.Kill()
+                    $tunnelStopped = $true
+                    if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
+                        Write-Host "🔗 Killed discovered SSH tunnel process (PID: $foundPid)" -ForegroundColor Yellow
+                    }
+                }
+            }
+            catch {
+                if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Warning "Could not kill discovered tunnel process: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+    
+    # Legacy cleanup
     if ($global:OllamaConfig.Server.TunnelProcess -and -not $global:OllamaConfig.Server.TunnelProcess.HasExited) {
         try {
             $global:OllamaConfig.Server.TunnelProcess.Kill()
+            $tunnelStopped = $true
         }
         catch { }
-        $global:OllamaConfig.Server.TunnelProcess = $null
     }
+    
+    # Clean up stored references
+    $global:OllamaConfig.Server.TunnelProcess = $null
+    $global:OllamaConfig.Server.TunnelProcessId = $null
     $global:OllamaConfig.Server.IsConnected = $false
     
-    if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-        Write-Host "🔗 SSH tunnel stopped" -ForegroundColor Yellow
+    if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug -and $tunnelStopped) {
+        Write-Host "✅ SSH tunnel stopped successfully" -ForegroundColor Green
+    }
+    elseif (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
+        Write-Host "⚠️ SSH tunnel stop attempted (no active tunnel found)" -ForegroundColor Yellow
     }
 }
 
@@ -972,6 +1107,116 @@ function Get-PredictionLog {
 # INITIALIZATION AND CLEANUP
 # --------------------------------------------------------------------------------------------------------
 
+function Register-PowerAugerCleanupEvents {
+    [CmdletBinding()]
+    param()
+    
+    try {
+        # PowerShell exit event (primary cleanup)
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+            try {
+                Save-PowerAugerState
+                Stop-OllamaTunnel -Silent
+            }
+            catch {
+                # Silent cleanup - errors during shutdown are not critical
+            }
+        } | Out-Null
+        
+        # .NET AppDomain exit event (backup cleanup for unexpected exits)
+        $cleanupAction = {
+            try {
+                Stop-OllamaTunnel -Silent
+            }
+            catch {
+                # Silent cleanup
+            }
+        }
+        
+        # Register .NET ProcessExit event for more reliable cleanup
+        [System.AppDomain]::CurrentDomain.add_ProcessExit($cleanupAction)
+        
+        # Windows console control event (Ctrl+C, system shutdown, etc.)
+        if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+            try {
+                # Use P/Invoke to handle Windows console control events
+                Add-Type -TypeDefinition @"
+                    using System;
+                    using System.Runtime.InteropServices;
+                    
+                    public static class ConsoleHelper {
+                        public delegate bool ConsoleCtrlDelegate(int dwCtrlType);
+                        
+                        [DllImport("kernel32.dll")]
+                        public static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
+                        
+                        public const int CTRL_C_EVENT = 0;
+                        public const int CTRL_BREAK_EVENT = 1;
+                        public const int CTRL_CLOSE_EVENT = 2;
+                        public const int CTRL_LOGOFF_EVENT = 5;
+                        public const int CTRL_SHUTDOWN_EVENT = 6;
+                        
+                        public static bool ConsoleCtrlHandler(int dwCtrlType) {
+                            try {
+                                // Call PowerShell function for cleanup
+                                System.Management.Automation.PowerShell.Create().AddScript("Stop-OllamaTunnel -Silent").Invoke();
+                                return true;
+                            } catch {
+                                return false;
+                            }
+                        }
+                    }
+"@ -ErrorAction SilentlyContinue
+                
+                # Register the console control handler
+                $handler = [ConsoleHelper+ConsoleCtrlDelegate] {
+                    param($ctrlType)
+                    try {
+                        Stop-OllamaTunnel -Silent
+                        return $true
+                    }
+                    catch {
+                        return $false
+                    }
+                }
+                
+                [ConsoleHelper]::SetConsoleCtrlHandler($handler, $true)
+            }
+            catch {
+                # P/Invoke setup failed, continue with other cleanup methods
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Warning "Could not register Windows console control handler: $($_.Exception.Message)"
+                }
+            }
+        }
+        
+        # WMI system shutdown event (Windows-specific)
+        try {
+            Register-WmiEvent -Query "SELECT * FROM Win32_SystemShutdownEvent" -Action {
+                try {
+                    Save-PowerAugerState
+                    Stop-OllamaTunnel -Silent
+                }
+                catch {
+                    # Silent cleanup
+                }
+            } -ErrorAction SilentlyContinue | Out-Null
+        }
+        catch {
+            # WMI events might not be available in all environments
+        }
+        
+        if ($global:OllamaConfig.Performance.EnableDebug) {
+            Write-Host "✅ Registered comprehensive cleanup events" -ForegroundColor Green
+        }
+    }
+    catch {
+        if ($global:OllamaConfig.Performance.EnableDebug) {
+            Write-Warning "Some cleanup events could not be registered: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Initialize-OllamaPredictor {
     [CmdletBinding()]
     param(
@@ -1032,11 +1277,8 @@ function Initialize-OllamaPredictor {
         }
     }
     
-    # Register cleanup events
-    Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-        Save-PowerAugerState
-        Stop-OllamaTunnel -Silent
-    } | Out-Null
+    # Register comprehensive cleanup events for Windows
+    Register-PowerAugerCleanupEvents
     
     # Register command feedback (if available)
     Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action {
