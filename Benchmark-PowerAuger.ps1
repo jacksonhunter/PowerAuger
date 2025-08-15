@@ -18,9 +18,9 @@ Import-Module "$PSScriptRoot\modules\PowerAuger\PowerAuger.psm1" -Force
 # Test scenarios designed to trigger different models
 $testScenarios = @(
     @{
-        Name = "Fast Model Tests"
+        Name        = "Fast Model Tests"
         Description = "Simple completions that should use fast model"
-        Tests = @(
+        Tests       = @(
             "Get-Ch",     # Should complete to Get-ChildItem
             "Import-M",   # Should complete to Import-Module  
             "git st",     # Should complete to git status
@@ -34,9 +34,9 @@ $testScenarios = @(
         )
     },
     @{
-        Name = "Context Model Tests" 
+        Name        = "Context Model Tests" 
         Description = "Complex completions that should use context model"
-        Tests = @(
+        Tests       = @(
             "Get-Process | Where-Object",           # Pipeline operations
             "Get-ChildItem -Path C:\Windows -Recurse", # Complex parameters
             "Import-Module -Name PowerAuger -Force",   # Module with parameters
@@ -55,7 +55,7 @@ $testScenarios = @(
 $benchmarkResults = @{
     StartTime = Get-Date
     Scenarios = @()
-    Summary = @{}
+    Summary   = @{}
 }
 
 function Measure-PredictionPerformance {
@@ -90,10 +90,10 @@ function Measure-PredictionPerformance {
             
             if (-not $WarmUp) {
                 $measurements += @{
-                    Iteration = $i
-                    Latency = $latency
+                    Iteration       = $i
+                    Latency         = $latency
                     PredictionCount = $predictions.Count
-                    Success = $true
+                    Success         = $true
                     FirstPrediction = if ($predictions.Count -gt 0) { $predictions[0] } else { "" }
                 }
             }
@@ -101,11 +101,11 @@ function Measure-PredictionPerformance {
         catch {
             if (-not $WarmUp) {
                 $measurements += @{
-                    Iteration = $i
-                    Latency = 999999  # High latency for failures
+                    Iteration       = $i
+                    Latency         = 999999  # High latency for failures
                     PredictionCount = 0
-                    Success = $false
-                    Error = $_.Exception.Message
+                    Success         = $false
+                    Error           = $_.Exception.Message
                 }
             }
         }
@@ -137,21 +137,22 @@ function Calculate-Statistics {
     $sorted = $latencies | Sort-Object
     
     return @{
-        Min = [math]::Round($sorted[0], 1)
-        Max = [math]::Round($sorted[-1], 1) 
-        Avg = [math]::Round(($latencies | Measure-Object -Average).Average, 1)
-        Median = [math]::Round($sorted[[math]::Floor($sorted.Count / 2)], 1)
-        P95 = [math]::Round($sorted[[math]::Floor($sorted.Count * 0.95)], 1)
-        P99 = [math]::Round($sorted[[math]::Floor($sorted.Count * 0.99)], 1)
+        Min         = [math]::Round($sorted[0], 1)
+        Max         = [math]::Round($sorted[-1], 1) 
+        Avg         = [math]::Round(($latencies | Measure-Object -Average).Average, 1)
+        Median      = [math]::Round($sorted[[math]::Floor($sorted.Count / 2)], 1)
+        P95         = [math]::Round($sorted[[math]::Floor($sorted.Count * 0.95)], 1)
+        P99         = [math]::Round($sorted[[math]::Floor($sorted.Count * 0.99)], 1)
         SuccessRate = [math]::Round(($successCount / $Measurements.Count) * 100, 1)
-        TotalTests = $Measurements.Count
+        TotalTests  = $Measurements.Count
     }
 }
 
 # Warm up the system
 Write-Host "`n🔥 Warming up system..." -ForegroundColor Yellow
 foreach ($scenario in $testScenarios) {
-    foreach ($test in $scenario.Tests[0..2]) {  # Just warm up with first few tests
+    foreach ($test in $scenario.Tests[0..2]) {
+        # Just warm up with first few tests
         Measure-PredictionPerformance -InputText $test -TestName "Warmup" -WarmUp | Out-Null
     }
 }
@@ -167,9 +168,9 @@ foreach ($scenario in $testScenarios) {
     Write-Host $scenario.Description -ForegroundColor Gray
     
     $scenarioResults = @{
-        Name = $scenario.Name
+        Name        = $scenario.Name
         Description = $scenario.Description
-        Tests = @()
+        Tests       = @()
     }
     
     foreach ($testInput in $scenario.Tests) {
@@ -179,9 +180,9 @@ foreach ($scenario in $testScenarios) {
         $stats = Calculate-Statistics -Measurements $measurements
         
         $testResult = @{
-            InputText = $testInput
+            InputText    = $testInput
             Measurements = $measurements
-            Statistics = $stats
+            Statistics   = $stats
         }
         
         $scenarioResults.Tests += $testResult
@@ -266,9 +267,11 @@ if ($fastStats -and $contextStats) {
     
     if ($speedDifference -lt 100) {
         Write-Host "✅ Performance difference is acceptable (<100ms)" -ForegroundColor Green
-    } elseif ($speedDifference -lt 500) {
+    }
+    elseif ($speedDifference -lt 500) {
         Write-Host "⚠️ Consider optimization - difference is $([math]::Round($speedDifference, 0))ms" -ForegroundColor Yellow
-    } else {
+    }
+    else {
         Write-Host "❌ Significant performance gap - optimization needed" -ForegroundColor Red
     }
 }

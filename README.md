@@ -28,29 +28,24 @@ Even in its experimental stage, PowerAuger is built on a production-grade founda
 
 ## Vision & Roadmap (What's Coming Next)
 
-PowerAuger aims to be the most intelligent shell assistant available. The architecture is designed to support a future that is deeply integrated and contextually brilliant.
+PowerAuger aims to be the most intelligent shell assistant available. The architecture is designed to support a future that is deeply integrated and contextually brilliant. The following strategic initiatives are planned to elevate PowerAuger's intelligence and performance to the next level, organized by implementation timeline.
 
-### 🌐 True Cross-Platform Mastery
+### Short-Term Goals (Next Minor Releases)
 
-While built on the cross-platform PowerShell 7+, future work will focus on first-class support and optimization for macOS and Linux environments, including context providers for `apt`, `brew`, and other platform-specific tooling.
+-   **Model Pre-warming & State Tracking**: Eliminate "first-use" latency by intelligently pre-loading the fast and context models at startup. The engine will track which models are active in memory to optimize resource usage.
+-   **Return to JSON-First Reliability (Phase 1)**: Begin the transition back to a structured JSON-first approach by enhancing model prompts and providing few-shot examples to ensure reliable, parsable output. This enables more robust error handling and richer data exchange with the models.
+-   **SSH Tunnel Robustness**: Improve the stability of the background SSH tunnel by using industry-standard flags (`ssh -f`).
 
-### ✨ Expanded Context Providers
+### Mid-Term Goals (v4.0 Major Release)
 
-The modular engine is ready for expansion. Imagine PowerAuger understanding your:
+-   **Dynamic Prompt Enrichment**: Transform the prompt from a static query into a dynamic conversation. The engine will feed recently accepted suggestions back into new prompts, teaching the model about the user's immediate workflow and dramatically improving the relevance of its predictions.
+-   **Persistent Project-Level Context**: Go beyond reactive context by creating persistent, file-based context for specific projects. PowerAuger will learn about your most-used files, commands, and patterns within a repository and use that knowledge to inform future suggestions.
 
--   Active `docker` containers and images
--   Current `kubectl` context and available namespaces
--   Authenticated AWS/Azure CLI profile and available resources
--   The contents of a file you've just referenced (`cat file.json | ...`)
+### Long-Term Goals (Beyond v4.0)
 
-### 📌 **Pinned Feature: Dynamic Prediction View**
+-   **Asynchronous Prediction Pipeline**: Decouple the UI from the AI. The predictor will provide instantaneous history-based suggestions while a background process gathers deep context and queries the model, seamlessly updating the suggestions when ready. This will create a truly non-blocking, fluid user experience.
 
-This is the ultimate user experience goal. PowerAuger will intelligently switch its presentation style based on confidence and ambiguity.
-
--   **High Confidence**: A single, brilliant suggestion appears as subtle inline "ghost text".
--   **Multiple Possibilities**: When several good options exist, it will automatically switch to a full list view, allowing you to see all relevant predictions at a glance.
-
-This adaptability will make the tool feel less like a simple autocompleter and more like a true pair-programmer for your shell.
+---
 
 ---
 

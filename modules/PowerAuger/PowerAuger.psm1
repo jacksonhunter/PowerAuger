@@ -976,7 +976,8 @@ function Initialize-OllamaPredictor {
     [CmdletBinding()]
     param(
         [switch]$EnableDebug,
-        [switch]$StartTunnel = $true
+        [switch]$StartTunnel = $true,
+        [switch]$NoPrewarm
     )
     
     # Load configuration from file first, which may enable debug mode or change settings
@@ -995,6 +996,39 @@ function Initialize-OllamaPredictor {
         $connected = Start-OllamaTunnel
         if (-not $connected) {
             Write-Host "⚠️ Could not establish SSH tunnel. Predictor will use fallback mode." -ForegroundColor Yellow
+        }
+        elseif (-not $NoPrewarm) {
+            # Pre-warm models to reduce first-use latency
+            Write-Host "🔥 Pre-warming models in the background... (this may take a moment)" -ForegroundColor Yellow
+            
+            foreach ($modelEntry in $global:ModelRegistry.GetEnumerator()) {
+                $modelName = $modelEntry.Value.Name
+                $keepAlive = $modelEntry.Value.KeepAlive
+                
+                # Use a fire-and-forget job to load the model
+                Start-Job -ScriptBlock {
+                    param($modelToWarm, $keepAliveSetting, $apiUrl, $debugEnabled)
+                    
+                    if ($debugEnabled) {
+                        Write-Host "  - Sending pre-warm request to '$modelToWarm'..."
+                    }
+                    
+                    $body = @{
+                        model      = $modelToWarm
+                        prompt     = "Pre-warming model" # Simple prompt, just to load it
+                        stream     = $false
+                        keep_alive = $keepAliveSetting
+                    } | ConvertTo-Json
+
+                    try {
+                        # Use a long timeout because model loading can be slow.
+                        # The job runs in the background, so it won't block the user.
+                        $null = Invoke-RestMethod -Uri "$apiUrl/api/generate" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 120 -ErrorAction Stop
+                    } catch {
+                        # This is a background job, so we can't easily show warnings. The failure is non-critical.
+                    }
+                } -ArgumentList $modelName, $keepAlive, $global:OllamaConfig.Server.ApiUrl, $global:OllamaConfig.Performance.EnableDebug | Out-Null
+            }
         }
     }
     
@@ -1069,6 +1103,7 @@ $global:ModelRegistry = @{
     # Future models: Python, JavaScript, JSON-specific, etc.
 }
 
+
 # --------------------------------------------------------------------------------------------------------
 # MODULE EXPORTS
 # --------------------------------------------------------------------------------------------------------
@@ -1092,5 +1127,5 @@ Export-ModuleMember -Function @(
 
 # Auto-initialize if not in module development mode
 if (-not $env:OLLAMA_PREDICTOR_DEV_MODE) {
-    Initialize-OllamaPredictor -StartTunnel
+    Initialize-OllamaPredictor
 }
