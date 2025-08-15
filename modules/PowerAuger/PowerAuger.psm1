@@ -13,11 +13,11 @@
 $global:OllamaConfig = @{
     # Server Configuration
     Server      = @{
-        LinuxHost     = "192.168.50.194"
+        LinuxHost     = $env:POWERAUGER_LINUX_HOST -or "192.168.50.194" # Default can be overridden by env var
         LinuxPort     = 11434
         LocalPort     = 11434
-        SSHUser       = "jakko"
-        SSHKey        = "C:\Users\jacks\.ssh\.ssh\id_rsa"
+        SSHUser       = $env:POWERAUGER_SSH_USER -or $null
+        SSHKey        = $env:POWERAUGER_SSH_KEY -or $null
         TunnelProcess = $null
         IsConnected   = $false
         ApiUrl        = "http://localhost:11434"
@@ -59,6 +59,7 @@ $global:OllamaConfig = @{
 # Global state containers
 $global:PredictionCache = @{}
 $global:ChatSessions = @{}
+$global:PredictionLog = [System.Collections.Generic.List[object]]::new()
 $global:RecentTargets = @()
 $global:CommandHistory = @()
 $global:PerformanceMetrics = @{
@@ -66,6 +67,104 @@ $global:PerformanceMetrics = @{
     CacheHits      = 0
     AverageLatency = 0
     SuccessRate    = 1.0
+}
+
+# --------------------------------------------------------------------------------------------------------
+# DATA PERSISTENCE & CONFIGURATION
+# --------------------------------------------------------------------------------------------------------
+$global:PowerAugerDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".PowerAuger"
+$global:PowerAugerConfigFile = Join-Path $global:PowerAugerDataPath "config.json"
+$global:PowerAugerHistoryFile = Join-Path $global:PowerAugerDataPath "history.json"
+$global:PowerAugerCacheFile = Join-Path $global:PowerAugerDataPath "cache.json"
+$global:PowerAugerTargetsFile = Join-Path $global:PowerAugerDataPath "recent_targets.json"
+$global:PowerAugerLogFile = Join-Path $global:PowerAugerDataPath "prediction_log.json"
+
+function Merge-Hashtables {
+    param($base, $overlay)
+    $result = $base.Clone()
+    foreach ($key in $overlay.Keys) {
+        if ($result.ContainsKey($key) -and $result[$key] -is [hashtable] -and $overlay[$key] -is [hashtable]) {
+            $result[$key] = Merge-Hashtables -base $result[$key] -overlay $overlay[$key]
+        }
+        else {
+            $result[$key] = $overlay[$key]
+        }
+    }
+    return $result
+}
+
+function Load-PowerAugerConfiguration {
+    if (Test-Path $global:PowerAugerConfigFile) {
+        try {
+            $fileContent = Get-Content -Path $global:PowerAugerConfigFile -Raw
+            if (-not [string]::IsNullOrWhiteSpace($fileContent)) {
+                $loadedConfig = $fileContent | ConvertFrom-Json -AsHashtable
+                $global:OllamaConfig = Merge-Hashtables -base $global:OllamaConfig -overlay $loadedConfig
+            }
+        }
+        catch {
+            Write-Warning "Failed to load or parse configuration from $($global:PowerAugerConfigFile). Using defaults. Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Load-PowerAugerState {
+    if ($global:OllamaConfig.Performance.EnableDebug) {
+        Write-Host "🔄 Loading PowerAuger state from $($global:PowerAugerDataPath)..." -ForegroundColor Cyan
+    }
+
+    if (Test-Path $global:PowerAugerHistoryFile) {
+        try { $global:CommandHistory = Get-Content -Path $global:PowerAugerHistoryFile -Raw | ConvertFrom-Json } catch { }
+    }
+    if (Test-Path $global:PowerAugerCacheFile) {
+        try { $global:PredictionCache = Get-Content -Path $global:PowerAugerCacheFile -Raw | ConvertFrom-Json -AsHashtable } catch { }
+    }
+    if (Test-Path $global:PowerAugerTargetsFile) {
+        try { $global:RecentTargets = Get-Content -Path $global:PowerAugerTargetsFile -Raw | ConvertFrom-Json } catch { }
+    }
+    if (Test-Path $global:PowerAugerLogFile) {
+        try {
+            $logData = Get-Content -Path $global:PowerAugerLogFile -Raw | ConvertFrom-Json
+            if ($logData) { $global:PredictionLog = [System.Collections.Generic.List[object]]::new($logData) }
+        }
+        catch { }
+    }
+}
+
+function Save-PowerAugerState {
+    [CmdletBinding()]
+    param()
+
+    if ($global:OllamaConfig.Performance.EnableDebug) {
+        Write-Host "💾 Saving PowerAuger state to $($global:PowerAugerDataPath)..." -ForegroundColor Cyan
+    }
+
+    if (-not (Test-Path $global:PowerAugerDataPath)) {
+        New-Item -Path $global:PowerAugerDataPath -ItemType Directory -Force | Out-Null
+    }
+
+    # Save Configuration
+    Save-PowerAugerConfiguration
+
+    # Save other state files
+    $global:CommandHistory | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerHistoryFile -Encoding UTF8 -ErrorAction SilentlyContinue
+    $global:PredictionCache | ConvertTo-Json -Depth 10 | Set-Content -Path $global:PowerAugerCacheFile -Encoding UTF8 -ErrorAction SilentlyContinue
+    $global:RecentTargets | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerTargetsFile -Encoding UTF8 -ErrorAction SilentlyContinue
+    $global:PredictionLog | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerLogFile -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+function Save-PowerAugerConfiguration {
+    try {
+        if (-not (Test-Path $global:PowerAugerDataPath)) {
+            New-Item -Path $global:PowerAugerDataPath -ItemType Directory -Force | Out-Null
+        }
+        $configToSave = $global:OllamaConfig.Clone()
+        $configToSave.Server.Remove('TunnelProcess')
+        $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $global:PowerAugerConfigFile -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "Failed to save configuration: $($_.Exception.Message)"
+    }
 }
 
 # --------------------------------------------------------------------------------------------------------
@@ -187,6 +286,86 @@ function Select-OptimalModel {
 # ADVANCED CONTEXT ENGINE
 # --------------------------------------------------------------------------------------------------------
 
+function _Get-EnvironmentContext {
+    param([hashtable]$Context)
+
+    $Context.Environment = @{
+        Directory         = (Get-Location).Path
+        PowerShellVersion = $PSVersionTable.PSVersion
+        IsElevated        = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        FilesInDirectory  = @(Get-ChildItem -Name -File | Select-Object -First 10)
+    }
+}
+
+function _Get-CommandContext {
+    param([hashtable]$Context)
+
+    $inputLine = $Context.InputLine
+    if ([string]::IsNullOrWhiteSpace($inputLine)) { return }
+
+    $tokens = $inputLine.Trim() -split '\s+'
+    if ($tokens.Count -gt 0) {
+        $commandName = $tokens[0]
+        $Context.ParsedCommand = @{
+            Name       = $commandName
+            Arguments  = $tokens[1..($tokens.Count - 1)]
+            IsComplete = $inputLine.EndsWith(' ')
+        }
+        
+        $commandInfo = Get-Command $commandName -ErrorAction SilentlyContinue
+        if ($commandInfo) {
+            $Context.ParsedCommand.Type = $commandInfo.CommandType
+            $Context.ParsedCommand.Parameters = @($commandInfo.Parameters.Keys)
+            $Context.HasComplexContext = $true
+        }
+    }
+}
+
+function _Get-FileTargetContext {
+    param([hashtable]$Context)
+
+    if (-not $Context.ParsedCommand) { return }
+
+    foreach ($arg in $Context.ParsedCommand.Arguments) {
+        if (Test-Path $arg -IsValid) {
+            $targetInfo = @{ Path = $arg; Exists = Test-Path $arg }
+            if ($targetInfo.Exists) {
+                try {
+                    $item = Get-Item $arg -ErrorAction Stop
+                    $targetInfo.Type = if ($item.PSIsContainer) { "Directory" } else { "File" }
+                    $targetInfo.Size = if (-not $item.PSIsContainer) { $item.Length } else { $null }
+                }
+                catch {
+                    # Could be a path that is valid but we don't have access to, ignore error
+                }
+            }
+            $Context.Targets += $targetInfo
+            $Context.HasTargets = $true
+        }
+    }
+}
+
+function _Get-GitContext {
+    param([hashtable]$Context)
+
+    # Check if we are in a git repo. Test-Path is faster than running git command.
+    if (Test-Path (Join-Path $Context.Environment.Directory ".git")) {
+        $Context.Environment.IsGitRepo = $true
+        try {
+            # Use -C to ensure we run git in the correct directory, regardless of PowerShell's current location
+            $gitBranch = git -C $Context.Environment.Directory branch --show-current 2>$null
+            $gitChanges = (git -C $Context.Environment.Directory status --porcelain 2>$null | Measure-Object).Count
+            
+            if ($gitBranch) { $Context.Environment.GitBranch = $gitBranch.Trim() }
+            if ($gitChanges -ge 0) { $Context.Environment.GitChanges = $gitChanges }
+        }
+        catch { } # Silently fail if git command fails
+    }
+    else {
+        $Context.Environment.IsGitRepo = $false
+    }
+}
+
 function Get-EnhancedContext {
     [CmdletBinding()]
     param([string]$InputLine, [int]$CursorIndex = 0)
@@ -195,64 +374,23 @@ function Get-EnhancedContext {
         InputLine         = $InputLine
         CursorIndex       = $CursorIndex
         Timestamp         = Get-Date
-        Environment       = @{}
-        ParsedCommand     = @{}
+        Environment       = @{} # Populated by providers
+        ParsedCommand     = $null # Populated by providers
         Targets           = @()
         HasComplexContext = $false
         HasTargets        = $false
     }
     
-    # Environment context
-    $context.Environment = @{
-        Directory         = Get-Location
-        IsGitRepo         = Test-Path .git
-        PowerShellVersion = $PSVersionTable.PSVersion
-        IsElevated        = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        FilesInDirectory  = @(Get-ChildItem -Name -File | Select-Object -First 10)
-    }
-    
-    # Parse command structure
-    $tokens = $InputLine.Trim() -split '\s+'
-    if ($tokens.Count -gt 0) {
-        $commandName = $tokens[0]
-        $context.ParsedCommand = @{
-            Name       = $commandName
-            Arguments  = $tokens[1..($tokens.Count - 1)]
-            IsComplete = $InputLine.EndsWith(' ')
-        }
-        
-        # Get command info if available
-        $commandInfo = Get-Command $commandName -ErrorAction SilentlyContinue
-        if ($commandInfo) {
-            $context.ParsedCommand.Type = $commandInfo.CommandType
-            $context.ParsedCommand.Parameters = @($commandInfo.Parameters.Keys)
-            $context.HasComplexContext = $true
-        }
-    }
-    
-    # Target analysis (files, paths in arguments)
-    foreach ($arg in $context.ParsedCommand.Arguments) {
-        if (Test-Path $arg -IsValid) {
-            $targetInfo = @{ Path = $arg; Exists = Test-Path $arg }
-            if ($targetInfo.Exists) {
-                $item = Get-Item $arg -ErrorAction SilentlyContinue
-                if ($item) {
-                    $targetInfo.Type = if ($item.PSIsContainer) { "Directory" } else { "File" }
-                    $targetInfo.Size = if (-not $item.PSIsContainer) { $item.Length } else { $null }
-                }
-            }
-            $context.Targets += $targetInfo
-            $context.HasTargets = $true
-        }
-    }
-    
-    # Git context if in repo
-    if ($context.Environment.IsGitRepo) {
+    # Execute all registered context providers in order
+    foreach ($provider in $global:ContextProviders.GetEnumerator()) {
         try {
-            $context.Environment.GitBranch = git branch --show-current 2>$null
-            $context.Environment.GitChanges = (git status --porcelain 2>$null | Measure-Object).Count
+            & $provider.Value -context $context
         }
-        catch { }
+        catch {
+            if ($global:OllamaConfig.Performance.EnableDebug) {
+                Write-Warning "Context provider '$($provider.Name)' failed: $($_.Exception.Message)"
+            }
+        }
     }
     
     return $context
@@ -561,8 +699,9 @@ function Get-CommandPrediction {
         }
         
         # FIXED: Convert to consistent format - handle both strings and objects
-        if ($result.completions) {
-            return $result.completions | ForEach-Object { 
+        $finalCompletions = @()
+        if ($result -and $result.completions) {
+            $finalCompletions = $result.completions | ForEach-Object { 
                 if ($_ -is [string]) { 
                     $_ 
                 } 
@@ -570,23 +709,41 @@ function Get-CommandPrediction {
                     $_.text 
                 } 
                 else { 
-                    $_.ToString() 
+                    $_.ToString()
                 }
             } | Where-Object { $_ -and $_.Trim() }
         }
         elseif ($result -is [array]) {
-            return $result
+            # Handle cases where raw array is returned
+            $finalCompletions = $result
         }
-        else {
-            return @()
+
+        # NEW: Log prediction if enabled
+        if ($global:OllamaConfig.Performance.EnablePredictionLogging) {
+            $logEntry = @{
+                Timestamp    = Get-Date
+                InputLine    = $InputLine
+                ModelUsed    = $modelConfig.Name
+                ResultSource = if ($result.context) { $result.context } else { "unknown" }
+                Predictions  = $finalCompletions
+                CacheKey     = $cacheKey
+            }
+            $global:PredictionLog.Add($logEntry)
+            # Trim log if it gets too big to prevent memory issues
+            if ($global:PredictionLog.Count -gt 500) {
+                $global:PredictionLog.RemoveRange(0, $global:PredictionLog.Count - 500)
+            }
         }
+
+        return $finalCompletions
     }
     catch {
         if ($global:OllamaConfig.Performance.EnableDebug) {
             Write-Host "⚠️ Prediction error: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         $fallbackResult = Get-HistoryBasedSuggestions -InputLine $InputLine
-        return $fallbackResult.completions
+        # Ensure fallback also returns a consistent format
+        return if ($fallbackResult.completions) { $fallbackResult.completions } else { @() }
     }
 }
 
@@ -614,7 +771,8 @@ function Add-CommandToHistory {
     
     # Trim history if too large
     if ($global:CommandHistory.Count -gt $global:OllamaConfig.Performance.MaxHistoryLines) {
-        $global:CommandHistory = $global:CommandHistory | Select-Object -Last ($global:OllamaConfig.Performance.MaxHistoryLines * 0.8)
+        $startIndex = $global:CommandHistory.Count - $global:OllamaConfig.Performance.MaxHistoryLines
+        $global:CommandHistory = $global:CommandHistory[$startIndex..($global:CommandHistory.Count - 1)]
     }
     
     # Update recent targets
@@ -675,6 +833,23 @@ function Show-PredictorStatus {
     Write-Host ""
 }
 
+function Get-PredictionLog {
+    [CmdletBinding()]
+    param(
+        [int]$Last = 50
+    )
+    <#
+    .SYNOPSIS
+    Retrieves the log of recent predictions for troubleshooting.
+    #>
+    
+    $count = [math]::Min($Last, $global:PredictionLog.Count)
+    if ($count -gt 0) {
+        # Return in reverse chronological order (most recent first)
+        return $global:PredictionLog[($global:PredictionLog.Count - 1)..($global:PredictionLog.Count - $count)]
+    }
+    return @()
+}
 # --------------------------------------------------------------------------------------------------------
 # INITIALIZATION AND CLEANUP
 # --------------------------------------------------------------------------------------------------------
@@ -686,11 +861,16 @@ function Initialize-OllamaPredictor {
         [switch]$StartTunnel = $true
     )
     
+    # Load configuration from file first, which may enable debug mode or change settings
+    Load-PowerAugerConfiguration
+
     if ($EnableDebug) {
         $global:OllamaConfig.Performance.EnableDebug = $true
     }
     
     Write-Host "🚀 Initializing Ollama PowerShell Predictor..." -ForegroundColor Cyan
+    
+    Load-PowerAugerState
     
     # Start SSH tunnel
     if ($StartTunnel) {
@@ -702,6 +882,7 @@ function Initialize-OllamaPredictor {
     
     # Register cleanup events
     Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+        Save-PowerAugerState
         Stop-OllamaTunnel -Silent
     } | Out-Null
     
@@ -743,6 +924,9 @@ function Set-PredictorConfiguration {
     
     # Update API URL
     $global:OllamaConfig.Server.ApiUrl = "http://localhost:$($global:OllamaConfig.Server.LocalPort)"
+
+    # Persist configuration changes
+    Save-PowerAugerConfiguration
 }
 
 # --------------------------------------------------------------------------------------------------------
@@ -750,11 +934,14 @@ function Set-PredictorConfiguration {
 # --------------------------------------------------------------------------------------------------------
 
 # Context Provider Registry for future expansion
-$global:ContextProviders = @{
-    'Environment' = { param($context) return Get-EnhancedContext @PSBoundParameters }
-    'Git'         = { param($context) return Get-GitContext @PSBoundParameters }
-    'Files'       = { param($context) return Get-FileContext @PSBoundParameters }
-    # Future providers: Azure, AWS, Docker, etc.
+# This ordered dictionary defines the context providers and their execution order.
+# Each value is a scriptblock that accepts a single [hashtable]$Context parameter.
+$global:ContextProviders = [ordered]@{
+    'Environment' = { param($Context) _Get-EnvironmentContext -Context $Context }
+    'Command'     = { param($Context) _Get-CommandContext -Context $Context }
+    'FileTarget'  = { param($Context) _Get-FileTargetContext -Context $Context }
+    'Git'         = { param($Context) _Get-GitContext -Context $Context }
+    # Future providers can be added here: Azure, AWS, Docker, etc.
 }
 
 # Model Registry for easy expansion
@@ -779,7 +966,8 @@ Export-ModuleMember -Function @(
     'Stop-OllamaTunnel',
     'Test-OllamaConnection',
     'Show-PredictorStatus',
-    'Get-PredictorStatistics'
+    'Get-PredictorStatistics',
+    'Get-PredictionLog' # NEW
 )
 
 # Auto-initialize if not in module development mode

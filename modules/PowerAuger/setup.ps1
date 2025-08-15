@@ -6,6 +6,22 @@
 Write-Host "🔧 Starting Complete PowerAuger Setup..." -ForegroundColor Cyan
 
 # --------------------------------------------------------------------------------------------------------
+# STEP 0: CREATE CENTRAL DATA DIRECTORY
+# All configuration, history, and cache files will be stored here.
+# --------------------------------------------------------------------------------------------------------
+
+Write-Host "`n📁 Step 0: Setting up central data directory..." -ForegroundColor Yellow
+
+$powerAugerDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".PowerAuger"
+if (-not (Test-Path $powerAugerDataPath)) {
+    New-Item -Path $powerAugerDataPath -ItemType Directory -Force | Out-Null
+    Write-Host "✅ Created data directory at: $powerAugerDataPath" -ForegroundColor Green
+} else {
+    Write-Host "✅ Data directory already exists at: $powerAugerDataPath" -ForegroundColor Green
+}
+
+
+# --------------------------------------------------------------------------------------------------------
 # STEP 1: VERIFY MODULE IMPORT AND AUTO-INITIALIZATION
 # --------------------------------------------------------------------------------------------------------
 
@@ -76,8 +92,8 @@ if ($missingGlobals.Count -gt 0) {
                 LinuxHost     = "192.168.50.194"
                 LinuxPort     = 11434
                 LocalPort     = 11434
-                SSHUser       = "jakko"
-                SSHKey        = "C:\Users\jacks\.ssh\.ssh\id_rsa"
+                SSHUser       = $null # Will be auto-detected or prompted for
+                SSHKey        = $null # Will be auto-detected
                 TunnelProcess = $null
                 IsConnected   = $false
                 ApiUrl        = "http://localhost:11434"
@@ -113,6 +129,7 @@ if ($missingGlobals.Count -gt 0) {
                 RecentTargetsCount    = 30
                 SessionCleanupMinutes = 30
                 EnableDebug           = $false
+                EnablePredictionLogging = $true # Enabled by default as requested
             }
         }
         Write-Host "✅ OllamaConfig initialized" -ForegroundColor Green
@@ -440,6 +457,7 @@ try {
     
     # Initialize the predictor with settings
     Initialize-OllamaPredictor -EnableDebug:$debugMode
+    $global:OllamaConfig.Performance.EnableDebug = $debugMode # Ensure this is set for saving
     Write-Host "✅ PowerAuger Predictor initialized successfully!" -ForegroundColor Green
 }
 catch {
@@ -447,33 +465,65 @@ catch {
 }
 
 # --------------------------------------------------------------------------------------------------------
-# STEP 7: FINAL CONFIGURATION AND NEXT STEPS
+# STEP 7: CENTRALIZED CONFIGURATION & PROFILE SETUP
 # --------------------------------------------------------------------------------------------------------
 
-Write-Host "`n💾 Step 7: Configuration persistence..." -ForegroundColor Yellow
+Write-Host "`n💾 Step 7: Saving configuration and setting up profile..." -ForegroundColor Yellow
 
-$saveConfig = Read-Host "Save configuration to file for future sessions? (Y/n)"
-if ($saveConfig -ne 'n' -and $saveConfig -ne 'N') {
-    $configPath = "$env:USERPROFILE\.powerauger-config.json"
+# --- Part A: Save configuration and create data files in ~/.PowerAuger ---
+Write-Host "📝 Saving configuration to JSON..." -ForegroundColor Cyan
+try {
+    $configPath = Join-Path $powerAugerDataPath "config.json"
     
-    try {
-        # Create a serializable version of the config
-        $configToSave = @{
-            Server      = $global:OllamaConfig.Server
-            Models      = $global:OllamaConfig.Models
-            Performance = $global:OllamaConfig.Performance
-            SavedAt     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    # Create a serializable version of the config, removing the live process object
+    $configToSave = $global:OllamaConfig.Clone()
+    $configToSave.Server.Remove('TunnelProcess')
+    $configToSave.Add('SavedAt', (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+
+    $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath -Encoding UTF8
+    Write-Host "✅ Configuration saved to: $configPath" -ForegroundColor Green
+
+    # Create placeholder data files so the module can find them
+    $placeholderFiles = @(
+        "history.json",
+        "cache.json",
+        "recent_targets.json",
+        "prediction_log.json"
+    )
+    foreach ($file in $placeholderFiles) {
+        $filePath = Join-Path $powerAugerDataPath $file
+        if (-not (Test-Path $filePath)) {
+            $content = if ($file -eq "cache.json") { "{}" } else { "[]" }
+            Set-Content -Path $filePath -Value $content -Encoding UTF8
+            Write-Host "✅ Created placeholder data file: $file" -ForegroundColor Green
         }
-        
-        # Remove non-serializable process object
-        $configToSave.Server.TunnelProcess = $null
-        
-        $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath -Encoding UTF8
-        Write-Host "✅ Configuration saved to: $configPath" -ForegroundColor Green
     }
-    catch {
-        Write-Host "❌ Failed to save configuration: $($_.Exception.Message)" -ForegroundColor Red
+}
+catch {
+    Write-Host "❌ Failed to save configuration or data files: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# --- Part B: Add auto-load command to PowerShell Profile ---
+Write-Host "`n🔌 Configuring PowerShell profile for auto-loading..." -ForegroundColor Cyan
+try {
+    if (-not (Test-Path $PROFILE)) {
+        New-Item -Path $PROFILE -Type File -Force | Out-Null
+        Write-Host "✅ Created new PowerShell profile at: $PROFILE" -ForegroundColor Green
     }
+
+    $profileContent = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
+    $loaderBlock = "# PowerAuger Auto-Loader`nImport-Module PowerAuger"
+
+    if ($profileContent -notlike "*# PowerAuger Auto-Loader*") {
+        Add-Content -Path $PROFILE -Value "`n`n$loaderBlock"
+        Write-Host "✅ Added PowerAuger auto-loader to your profile." -ForegroundColor Green
+    } else {
+        Write-Host "✅ PowerAuger auto-loader already exists in your profile." -ForegroundColor Green
+    }
+    Write-Host "   PowerAuger will now load automatically in new PowerShell sessions." -ForegroundColor White
+}
+catch {
+    Write-Host "❌ Failed to write to profile: $($_.Exception.Message)" -ForegroundColor Red
 }
 
 # --------------------------------------------------------------------------------------------------------
@@ -488,6 +538,7 @@ Write-Host "Linux Host: $($global:OllamaConfig.Server.LinuxHost)" -ForegroundCol
 Write-Host "SSH User: $($global:OllamaConfig.Server.SSHUser)" -ForegroundColor White
 Write-Host "Fast Model: $($global:OllamaConfig.Models.FastCompletion.Name)" -ForegroundColor White
 Write-Host "Context Model: $($global:OllamaConfig.Models.ContextAware.Name)" -ForegroundColor White
+Write-Host "Data Path: $powerAugerDataPath" -ForegroundColor White
 
 Write-Host "`n📋 Next Steps:" -ForegroundColor Cyan
 Write-Host "1. Enable PSReadLine integration:" -ForegroundColor White

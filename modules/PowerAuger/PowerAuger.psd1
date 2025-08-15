@@ -70,7 +70,8 @@
         'Stop-OllamaTunnel',              # SSH tunnel management
         'Test-OllamaConnection',          # Connection testing
         'Show-PredictorStatus',           # Status display
-        'Get-PredictorStatistics'         # Performance metrics
+        'Get-PredictorStatistics',        # Performance metrics
+        'Get-PredictionLog'               # NEW: Prediction logging for troubleshooting
     )
     
     # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export
