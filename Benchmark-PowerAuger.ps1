@@ -221,40 +221,35 @@ foreach ($scenario in $benchmarkResults.Scenarios) {
 }
 
 # Model comparison
-Write-Host "`n🧠 MODEL PERFORMANCE COMPARISON" -ForegroundColor Cyan
+Write-Host "`n🧠 MODEL ACCEPTANCE & ERROR RATES" -ForegroundColor Cyan
 Write-Host "-" * 35
 
-$modelComparison = @{}
-foreach ($model in $finalStats.ModelMetrics.Keys) {
-    $modelData = $finalStats.ModelMetrics[$model]
-    $initialModel = $initialStats.ModelMetrics[$model]
-    
-    $modelComparison[$model] = @{
-        RequestsDuringTest = $modelData.Count - $initialModel.Count
-        AvgLatency = $modelData.AvgLatency
-        AcceptanceRate = $modelData.AcceptanceRate
-    }
-    
-    Write-Host "$model:" -ForegroundColor Yellow
-    Write-Host "  Requests during test: $($modelComparison[$model].RequestsDuringTest)" -ForegroundColor White
-    Write-Host "  Average latency: $($modelData.AvgLatency)ms" -ForegroundColor White
-    Write-Host "  Acceptance rate: $($modelData.AcceptanceRate)%" -ForegroundColor White
+foreach ($modelName in $finalStats.AcceptanceRates.Keys) {
+    $finalRate = $finalStats.AcceptanceRates[$modelName]
+    $initialRate = if ($initialStats.AcceptanceRates.ContainsKey($modelName)) { $initialStats.AcceptanceRates[$modelName] } else { @{ Offered = 0; Accepted = 0; Errors = 0 } }
+
+    $offeredDuringTest = $finalRate.Offered - $initialRate.Offered
+    $acceptedDuringTest = $finalRate.Accepted - $initialRate.Accepted
+    $errorsDuringTest = $finalRate.Errors - $initialRate.Errors
+
+    $acceptanceRateDuringTest = if ($offeredDuringTest -gt 0) { [math]::Round(($acceptedDuringTest / $offeredDuringTest) * 100, 1) } else { 0 }
+    $errorRateDuringTest = if ($acceptedDuringTest -gt 0) { [math]::Round(($errorsDuringTest / $acceptedDuringTest) * 100, 1) } else { 0 }
+
+    Write-Host "$modelName:" -ForegroundColor Yellow
+    Write-Host "  - Suggestions Offered: $offeredDuringTest" -ForegroundColor White
+    Write-Host "  - Suggestions Accepted: $acceptedDuringTest" -ForegroundColor White
+    Write-Host "  - Acceptance Rate: $acceptanceRateDuringTest%" -ForegroundColor White
+    $errorColor = if ($errorsDuringTest -gt 0) { "Red" } else { "Green" }
+    Write-Host "  - Errors on Acceptance: $errorsDuringTest ($($errorRateDuringTest)%)" -ForegroundColor $errorColor
 }
 
-# Context effectiveness analysis
-Write-Host "`n🎯 CONTEXT EFFECTIVENESS" -ForegroundColor Cyan
-Write-Host "-" * 25
-
-$contextBefore = $initialStats.ContextEffectiveness
-$contextAfter = $finalStats.ContextEffectiveness
-
-Write-Host "With Context:" -ForegroundColor Yellow
-Write-Host "  Predictions: +$($contextAfter.WithContext.Count - $contextBefore.WithContext.Count)" -ForegroundColor White
-Write-Host "  Acceptance Rate: $($contextAfter.WithContext.AcceptanceRate)%" -ForegroundColor White
-
-Write-Host "Without Context:" -ForegroundColor Yellow  
-Write-Host "  Predictions: +$($contextAfter.WithoutContext.Count - $contextBefore.WithoutContext.Count)" -ForegroundColor White
-Write-Host "  Acceptance Rate: $($contextAfter.WithoutContext.AcceptanceRate)%" -ForegroundColor White
+# Context provider performance
+Write-Host "`n🎯 CONTEXT PROVIDER PERFORMANCE" -ForegroundColor Cyan
+Write-Host "-" * 30
+Write-Host "Average time spent gathering context: $([math]::Round($finalStats.Performance.TotalContextTime, 1))ms" -ForegroundColor White
+foreach ($provider in ($finalStats.Performance.ProviderTimings.GetEnumerator() | Sort-Object Name)) {
+    Write-Host ("  - {0,-15}: {1}ms" -f $provider.Name, $([math]::Round($provider.Value, 2))) -ForegroundColor Gray
+}
 
 # Performance insights
 Write-Host "`n💡 PERFORMANCE INSIGHTS" -ForegroundColor Magenta
@@ -262,7 +257,6 @@ Write-Host "-" * 25
 
 $fastStats = $benchmarkResults.Summary["Fast Model Tests"]
 $contextStats = $benchmarkResults.Summary["Context Model Tests"]
-
 if ($fastStats -and $contextStats) {
     $speedDifference = $contextStats.Avg - $fastStats.Avg
     $speedRatio = [math]::Round($contextStats.Avg / $fastStats.Avg, 1)

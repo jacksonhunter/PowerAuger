@@ -159,10 +159,13 @@ if ($missingGlobals.Count -gt 0) {
     
     if ('PerformanceMetrics' -in $missingGlobals) {
         $global:PerformanceMetrics = @{
-            RequestCount   = 0
-            CacheHits      = 0
-            AverageLatency = 0
-            SuccessRate    = 1.0
+            RequestCount       = 0
+            CacheHits          = 0
+            AverageLatency     = 0
+            SuccessRate        = 1.0
+            ProviderTimings    = @{}
+            TotalContextTime   = 0
+            AcceptanceTracking = @{}
         }
         Write-Host "✅ PerformanceMetrics initialized" -ForegroundColor Green
     }
@@ -425,19 +428,31 @@ Write-Host "`n🚀 Step 6: Initializing PowerAuger Predictor..." -ForegroundColo
 
 try {
     # Ask about debug mode
-    $enableDebug = Read-Host "Enable debug mode for verbose logging? (y/N)"
-    if ($enableDebug -eq 'y' -or $enableDebug -eq 'Y') {
+    $response = Read-Host "Enable debug mode for verbose logging? (y/N)"
+    if ($response -eq 'y' -or $response -eq 'Y') {
         $debugMode = $true
         Write-Host "✅ Debug mode will be enabled" -ForegroundColor Green
     }
     else {
         $debugMode = $false
-        Write-Host "✅ Debug mode will be disabled" -ForegroundColor Green
+        Write-Host "✅ Debug mode disabled" -ForegroundColor Green
     }
-    
+
+    # Ask about prediction logging
+    $response = Read-Host "Enable prediction logging? (Logs inputs/outputs to ~/.PowerAuger/prediction_log.json) (y/N)"
+    if ($response -eq 'y' -or $response -eq 'Y') {
+        $loggingMode = $true
+        Write-Host "✅ Prediction logging will be enabled" -ForegroundColor Green
+    }
+    else {
+        $loggingMode = $false
+        Write-Host "✅ Prediction logging disabled" -ForegroundColor Green
+    }
+
     # Initialize the predictor with settings
     Initialize-OllamaPredictor -EnableDebug:$debugMode
     $global:OllamaConfig.Performance.EnableDebug = $debugMode # Ensure this is set for saving
+    $global:OllamaConfig.Performance.EnablePredictionLogging = $loggingMode # Ensure this is set for saving
     Write-Host "✅ PowerAuger Predictor initialized successfully!" -ForegroundColor Green
 }
 catch {

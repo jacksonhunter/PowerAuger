@@ -64,10 +64,13 @@ $global:PredictionLog = [System.Collections.Generic.List[object]]::new()
 $global:RecentTargets = @()
 $global:CommandHistory = @()
 $global:PerformanceMetrics = @{
-    RequestCount   = 0
-    CacheHits      = 0
-    AverageLatency = 0
-    SuccessRate    = 1.0
+    RequestCount       = 0
+    CacheHits          = 0
+    AverageLatency     = 0      # API latency
+    SuccessRate        = 1.0
+    ProviderTimings    = @{}    # Per-provider average latency
+    TotalContextTime   = 0      # Total context gathering average latency
+    AcceptanceTracking = @{} # Stores @{ Accepted = 0; Offered = 0 } per model/source
 }
 
 # --------------------------------------------------------------------------------------------------------
@@ -390,10 +393,23 @@ function Get-EnhancedContext {
         HasTargets        = $false
     }
     
+    $context.Timings = @{} # Add timings to the context object itself for logging
+    $totalContextTimeMs = 0
+
     # Execute all registered context providers in order
     foreach ($provider in $global:ContextProviders.GetEnumerator()) {
         try {
-            & $provider.Value -context $context
+            $timing = Measure-Command {
+                & $provider.Value -context $context
+            }
+            $providerName = $provider.Name
+            $ms = [math]::Round($timing.TotalMilliseconds, 2)
+            $context.Timings[$providerName] = $ms
+            $totalContextTimeMs += $ms
+
+            # Update global metrics with a running average
+            $currentAvg = if ($global:PerformanceMetrics.ProviderTimings.ContainsKey($providerName)) { $global:PerformanceMetrics.ProviderTimings[$providerName] } else { 0 }
+            $global:PerformanceMetrics.ProviderTimings[$providerName] = ($currentAvg + $ms) / 2
         }
         catch {
             if ($global:OllamaConfig.Performance.EnableDebug) {
@@ -401,6 +417,7 @@ function Get-EnhancedContext {
             }
         }
     }
+    $global:PerformanceMetrics.TotalContextTime = ($global:PerformanceMetrics.TotalContextTime + $totalContextTimeMs) / 2
     
     return $context
 }
@@ -727,14 +744,27 @@ function Get-CommandPrediction {
             $finalCompletions = $result
         }
 
+        # --- Acceptance Tracking: Increment "Offered" Count ---
+        # Use the result context (e.g., 'history_fallback') or the model name as the identifier
+        $modelIdentifier = if ($result.context) { $result.context } else { $modelConfig.Name }
+        if (-not $global:PerformanceMetrics.AcceptanceTracking.ContainsKey($modelIdentifier)) {
+            $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier] = @{ Accepted = 0; Offered = 0; Errors = 0 }
+        }
+        # Only count as "offered" if we actually produced suggestions
+        if ($finalCompletions.Count -gt 0) {
+            $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Offered++
+        }
+        # --- End Acceptance Tracking ---
+
         # NEW: Log prediction if enabled
         if ($global:OllamaConfig.Performance.EnablePredictionLogging) {
             $logEntry = @{
                 Timestamp    = Get-Date
                 InputLine    = $InputLine
-                ModelUsed    = $modelConfig.Name
-                ResultSource = if ($result.context) { $result.context } else { "unknown" }
+                ModelUsed    = $modelIdentifier # Use the more accurate identifier
+                ResultSource = $modelIdentifier
                 Predictions  = $finalCompletions
+                Timings      = $context.Timings
                 CacheKey     = $cacheKey
             }
             $global:PredictionLog.Add($logEntry)
@@ -767,6 +797,27 @@ function Add-CommandToHistory {
         [bool]$Success = $true,
         [string]$ErrorMessage = ""
     )
+    
+    # --- Acceptance Tracking: Check if this command was an accepted prediction ---
+    if ($global:PredictionLog.Count -gt 0) {
+        $lastPrediction = $global:PredictionLog[-1]
+        
+        # To be an "acceptance", the executed command must start with the input that generated
+        # the prediction, and it must exactly match one of the suggestions.
+        if ($Command.StartsWith($lastPrediction.InputLine) -and ($lastPrediction.Predictions -contains $Command)) {
+            $modelIdentifier = $lastPrediction.ModelUsed
+            if ($global:PerformanceMetrics.AcceptanceTracking.ContainsKey($modelIdentifier)) {
+                $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Accepted++
+                # NEW: Track if the accepted command resulted in an error
+                if (-not $Success) {
+                    $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Errors++
+                }
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "✅ Prediction accepted for model '$modelIdentifier'" -ForegroundColor DarkGreen
+                }
+            }
+        }
+    }
     
     $entry = @{
         Command   = $Command
@@ -802,7 +853,8 @@ function Clear-PowerAugerCache {
             try {
                 Remove-Item -Path $global:PowerAugerCacheFile -Force -ErrorAction Stop
                 Write-Host "✅ Prediction cache file removed." -ForegroundColor Green
-            } catch { Write-Warning "Failed to remove cache file: $($_.Exception.Message)" }
+            }
+            catch { Write-Warning "Failed to remove cache file: $($_.Exception.Message)" }
         }
         Write-Host "✅ In-memory prediction cache cleared." -ForegroundColor Green
     }
@@ -835,6 +887,25 @@ function Get-PredictorStatistics {
         }
     }
     
+    # Add calculated acceptance rates
+    $stats.AcceptanceRates = @{}
+    foreach ($modelEntry in $global:PerformanceMetrics.AcceptanceTracking.GetEnumerator()) {
+        $modelName = $modelEntry.Name
+        $accepted = $modelEntry.Value.Accepted
+        $offered = $modelEntry.Value.Offered
+        $errors = $modelEntry.Value.Errors
+        $rate = if ($offered -gt 0) { [math]::Round(($accepted / $offered) * 100, 1) } else { 0 }
+        $errorRate = if ($accepted -gt 0) { [math]::Round(($errors / $accepted) * 100, 1) } else { 0 }
+        
+        $stats.AcceptanceRates[$modelName] = @{
+            Accepted  = $accepted
+            Offered   = $offered
+            Rate      = $rate
+            Errors    = $errors
+            ErrorRate = $errorRate
+        }
+    }
+    
     return $stats
 }
 
@@ -856,12 +927,27 @@ function Show-PredictorStatus {
     
     Write-Host "Requests: $($stats.Performance.RequestCount)" -ForegroundColor White
     Write-Host "Cache Hit Rate: $($stats.Cache.HitRate)%" -ForegroundColor White
-    Write-Host "Average Latency: $([math]::Round($stats.Performance.AverageLatency, 0))ms" -ForegroundColor White
+    Write-Host "Avg API Latency: $([math]::Round($stats.Performance.AverageLatency, 0))ms" -ForegroundColor White
+    Write-Host "Avg Context Time: $([math]::Round($stats.Performance.TotalContextTime, 1))ms" -ForegroundColor White
     Write-Host "Success Rate: $([math]::Round($stats.Performance.SuccessRate * 100, 1))%" -ForegroundColor White
     Write-Host ""
     Write-Host "Models:" -ForegroundColor White
     Write-Host "  - Fast:    $($global:OllamaConfig.Models.FastCompletion.Name)" -ForegroundColor Gray
     Write-Host "  - Context: $($global:OllamaConfig.Models.ContextAware.Name)" -ForegroundColor Gray
+    
+    if ($stats.AcceptanceRates.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Acceptance Rate:" -ForegroundColor White
+        foreach ($rateEntry in ($stats.AcceptanceRates.GetEnumerator() | Sort-Object Name)) {
+            $line = "  - {0,-25}: {1}% ({2}/{3})" -f $rateEntry.Name, $rateEntry.Value.Rate, $rateEntry.Value.Accepted, $rateEntry.Value.Offered
+            if ($rateEntry.Value.Accepted -gt 0) {
+                $line += " | Errors: $($rateEntry.Value.ErrorRate)% ($($rateEntry.Value.Errors))"
+            }
+            $color = if ($rateEntry.Value.Errors -gt 0) { "Yellow" } else { "Gray" }
+            Write-Host $line -ForegroundColor $color
+        }
+    }
+
     Write-Host ""
 }
 

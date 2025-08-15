@@ -2,10 +2,10 @@
 
 @{
     # Script module or binary module file associated with this manifest
-    RootModule           = 'PowerAuger.psm1'
+    RootModule = 'PowerAuger.psm1'
     
     # Version number of this module
-    ModuleVersion        = '3.3.0'
+    ModuleVersion = '3.4.0'
     
     # Supported PSEditions
     CompatiblePSEditions = @('Core')
@@ -111,6 +111,13 @@
             
             # ReleaseNotes of this module
             ReleaseNotes = @'
+3.4.0 - Advanced Metrics & Reliability Release:
+- NEW: Implemented Acceptance Rate tracking to measure how often suggestions are used.
+- NEW: Implemented Error Rate tracking for accepted suggestions to measure model reliability.
+- ENHANCED: `Show-PredictorStatus` now displays detailed acceptance and error rates per model.
+- FIXED: Updated `Benchmark-PowerAuger.ps1` to work with the new advanced metrics.
+- FIXED: Hardened `setup.ps1` with updated fallback logic for improved resilience.
+
 3.3.0 - Diagnostics & Usability Release:
 - NEW: Added `Clear-PowerAugerCache` function to manually clear the prediction cache.
 - ENHANCED: `Show-PredictorStatus` now displays the currently configured model names for easier diagnostics.
