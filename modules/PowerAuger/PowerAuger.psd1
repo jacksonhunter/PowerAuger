@@ -5,7 +5,7 @@
     RootModule           = 'PowerAuger.psm1'
     
     # Version number of this module
-    ModuleVersion        = '3.1.0'
+    ModuleVersion        = '3.3.0'
     
     # Supported PSEditions
     CompatiblePSEditions = @('Core')
@@ -71,7 +71,9 @@
         'Test-OllamaConnection',          # Connection testing
         'Show-PredictorStatus',           # Status display
         'Get-PredictorStatistics',        # Performance metrics
-        'Get-PredictionLog'               # NEW: Prediction logging for troubleshooting
+        'Get-PredictionLog',              # NEW: Prediction logging for troubleshooting
+        'Save-PowerAugerState',           # NEW: State persistence for setup script
+        'Clear-PowerAugerCache'           # NEW: Diagnostic function to clear the cache
     )
     
     # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export
@@ -109,6 +111,16 @@
             
             # ReleaseNotes of this module
             ReleaseNotes = @'
+3.3.0 - Diagnostics & Usability Release:
+- NEW: Added `Clear-PowerAugerCache` function to manually clear the prediction cache.
+- ENHANCED: `Show-PredictorStatus` now displays the currently configured model names for easier diagnostics.
+
+3.2.0 - State Persistence & Setup Script Release:
+- NEW: Interactive `setup.ps1` script for guided installation and configuration.
+- NEW: Configuration is now loaded from `~/.PowerAuger/config.json`.
+- NEW: Module state (history, cache, targets, log) is persisted to JSON files in `~/.PowerAuge`r.
+- ENHANCED: Context engine refactored into a modular, extensible provider-based architecture.
+
 3.1.0 - Custom Model Compatibility Release:
 - FIXED: Native support for custom Ollama model templates
 - FIXED: Proper prompt formats for fast vs context models  

@@ -16,7 +16,8 @@ $powerAugerDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".PowerAuger"
 if (-not (Test-Path $powerAugerDataPath)) {
     New-Item -Path $powerAugerDataPath -ItemType Directory -Force | Out-Null
     Write-Host "✅ Created data directory at: $powerAugerDataPath" -ForegroundColor Green
-} else {
+}
+else {
     Write-Host "✅ Data directory already exists at: $powerAugerDataPath" -ForegroundColor Green
 }
 
@@ -123,12 +124,12 @@ if ($missingGlobals.Count -gt 0) {
             
             # Performance Settings
             Performance = @{
-                CacheTimeout          = 300
-                CacheSize             = 200
-                MaxHistoryLines       = 1000
-                RecentTargetsCount    = 30
-                SessionCleanupMinutes = 30
-                EnableDebug           = $false
+                CacheTimeout            = 300
+                CacheSize               = 200
+                MaxHistoryLines         = 1000
+                RecentTargetsCount      = 30
+                SessionCleanupMinutes   = 30
+                EnableDebug             = $false
                 EnablePredictionLogging = $true # Enabled by default as requested
             }
         }
@@ -167,12 +168,10 @@ if ($missingGlobals.Count -gt 0) {
     }
     
     if ('ContextProviders' -in $missingGlobals) {
-        $global:ContextProviders = @{
-            'Environment' = { param($context) return Get-EnhancedContext @PSBoundParameters }
-            'Git'         = { param($context) return Get-GitContext @PSBoundParameters }
-            'Files'       = { param($context) return Get-FileContext @PSBoundParameters }
-        }
-        Write-Host "✅ ContextProviders initialized" -ForegroundColor Green
+        Write-Host "❌ FATAL: ContextProviders global is missing even after module import." -ForegroundColor Red
+        Write-Host "   This indicates a corrupted module. Please reinstall PowerAuger or restart your session." -ForegroundColor Yellow
+        # This is a critical failure, so we stop the script.
+        return
     }
     
     if ('ModelRegistry' -in $missingGlobals) {
@@ -337,23 +336,11 @@ if ($connectionTest) {
                 } | Select-Object -First 1
                 
                 # Update configuration if we found better matches
-                $updated = $false
+                $configUpdated = $false
                 if ($fastMatch -and $fastMatch -ne $configuredFast) {
                     Write-Host "🔄 Updating Fast model: $configuredFast → $fastMatch" -ForegroundColor Cyan
                     $global:OllamaConfig.Models.FastCompletion.Name = $fastMatch
-                    if ($global:ModelRegistry -and $global:ModelRegistry.FastCompletion) {
-                        $global:ModelRegistry.FastCompletion.Name = $fastMatch
-                    }
-                    $updated = $true
-                    
-                    # ACTUALLY update the configuration using PowerAuger function
-                    try {
-                        Set-PredictorConfiguration -EnableDebug:$global:OllamaConfig.Performance.EnableDebug
-                        Write-Host "✅ Configuration updated via PowerAuger" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host "⚠️ Could not update via PowerAuger function: $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
+                    $configUpdated = $true
                 }
                 elseif ($fastMatch) {
                     Write-Host "✅ Fast model '$fastMatch' found and configured correctly" -ForegroundColor Green
@@ -361,32 +348,20 @@ if ($connectionTest) {
                 else {
                     Write-Host "⚠️ No PowerShell fast model found - using fallback" -ForegroundColor Yellow
                     # Try to use a general purpose small model as fallback
-                    $fallbackFast = $availableModels | Where-Object { 
-                        $_ -like "*qwen*4b*" -or $_ -like "*3b*" -or $_ -like "*small*" 
+                    $fallbackFast = $availableModels | Where-Object {
+                        $_ -like "*qwen*4b*" -or $_ -like "*3b*" -or $_ -like "*small*"
                     } | Select-Object -First 1
                     if ($fallbackFast) {
                         Write-Host "🔄 Using fallback fast model: $fallbackFast" -ForegroundColor Yellow
                         $global:OllamaConfig.Models.FastCompletion.Name = $fallbackFast
-                        $updated = $true
+                        $configUpdated = $true
                     }
                 }
                 
                 if ($contextMatch -and $contextMatch -ne $configuredContext) {
                     Write-Host "🔄 Updating Context model: $configuredContext → $contextMatch" -ForegroundColor Cyan
                     $global:OllamaConfig.Models.ContextAware.Name = $contextMatch
-                    if ($global:ModelRegistry -and $global:ModelRegistry.ContextAware) {
-                        $global:ModelRegistry.ContextAware.Name = $contextMatch
-                    }
-                    $updated = $true
-                    
-                    # ACTUALLY update the configuration using PowerAuger function
-                    try {
-                        Set-PredictorConfiguration -EnableDebug:$global:OllamaConfig.Performance.EnableDebug
-                        Write-Host "✅ Configuration updated via PowerAuger" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host "⚠️ Could not update via PowerAuger function: $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
+                    $configUpdated = $true
                 }
                 elseif ($contextMatch) {
                     Write-Host "✅ Context model '$contextMatch' found and configured correctly" -ForegroundColor Green
@@ -394,25 +369,30 @@ if ($connectionTest) {
                 else {
                     Write-Host "⚠️ No PowerShell context model found - using fallback" -ForegroundColor Yellow
                     # Try to use a larger general purpose model as fallback
-                    $fallbackContext = $availableModels | Where-Object { 
-                        $_ -like "*qwen*30b*" -or $_ -like "*coder*" -or $_ -like "*large*" 
+                    $fallbackContext = $availableModels | Where-Object {
+                        $_ -like "*qwen*30b*" -or $_ -like "*coder*" -or $_ -like "*large*"
                     } | Select-Object -First 1
                     if ($fallbackContext) {
                         Write-Host "🔄 Using fallback context model: $fallbackContext" -ForegroundColor Yellow
                         $global:OllamaConfig.Models.ContextAware.Name = $fallbackContext
-                        $updated = $true
+                        $configUpdated = $true
                     }
                 }
                 
                 # Auto-update configuration if successful
-                if ($updated) {
+                if ($configUpdated) {
                     Write-Host "✅ Model configuration updated!" -ForegroundColor Green
                     Write-Host "New Fast Model: $($global:OllamaConfig.Models.FastCompletion.Name)" -ForegroundColor Green
                     Write-Host "New Context Model: $($global:OllamaConfig.Models.ContextAware.Name)" -ForegroundColor Green
                     
-                    # Update the model registry to match
-                    $global:ModelRegistry.FastCompletion.Name = $global:OllamaConfig.Models.FastCompletion.Name
-                    $global:ModelRegistry.ContextAware.Name = $global:OllamaConfig.Models.ContextAware.Name
+                    # Update the configuration using the module's function to ensure persistence
+                    try {
+                        Set-PredictorConfiguration
+                        Write-Host "✅ Configuration saved successfully via PowerAuger." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "⚠️ Could not save updated model configuration: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
                 }
             }
             catch {
@@ -472,52 +452,36 @@ Write-Host "`n💾 Step 7: Saving configuration and setting up profile..." -Fore
 
 # --- Part A: Save configuration and create data files in ~/.PowerAuger ---
 Write-Host "📝 Saving configuration to JSON..." -ForegroundColor Cyan
-try {
-    $configPath = Join-Path $powerAugerDataPath "config.json"
-    
-    # Create a serializable version of the config, removing the live process object
-    $configToSave = $global:OllamaConfig.Clone()
-    $configToSave.Server.Remove('TunnelProcess')
-    $configToSave.Add('SavedAt', (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
-
-    $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath -Encoding UTF8
-    Write-Host "✅ Configuration saved to: $configPath" -ForegroundColor Green
-
-    # Create placeholder data files so the module can find them
-    $placeholderFiles = @(
-        "history.json",
-        "cache.json",
-        "recent_targets.json",
-        "prediction_log.json"
-    )
-    foreach ($file in $placeholderFiles) {
-        $filePath = Join-Path $powerAugerDataPath $file
-        if (-not (Test-Path $filePath)) {
-            $content = if ($file -eq "cache.json") { "{}" } else { "[]" }
-            Set-Content -Path $filePath -Value $content -Encoding UTF8
-            Write-Host "✅ Created placeholder data file: $file" -ForegroundColor Green
-        }
-    }
+try {    
+    # Use the module's built-in function to save all state files (config, history, etc.)
+    # This ensures consistency and centralizes the persistence logic.
+    Save-PowerAugerState
+    Write-Host "✅ Configuration and state files saved to: $powerAugerDataPath" -ForegroundColor Green
 }
 catch {
-    Write-Host "❌ Failed to save configuration or data files: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "❌ Failed to save configuration using Save-PowerAugerState: $($_.Exception.Message)" -ForegroundColor Red
 }
 
 # --- Part B: Add auto-load command to PowerShell Profile ---
 Write-Host "`n🔌 Configuring PowerShell profile for auto-loading..." -ForegroundColor Cyan
 try {
+    # Determine the absolute path to the module manifest to ensure it can be loaded from anywhere
+    $moduleManifestPath = Join-Path $PSScriptRoot "PowerAuger.psd1"
+
     if (-not (Test-Path $PROFILE)) {
         New-Item -Path $PROFILE -Type File -Force | Out-Null
         Write-Host "✅ Created new PowerShell profile at: $PROFILE" -ForegroundColor Green
     }
 
     $profileContent = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
-    $loaderBlock = "# PowerAuger Auto-Loader`nImport-Module PowerAuger"
+    # Use the absolute path to the manifest for robust loading. Use single quotes to handle spaces in path.
+    $loaderBlock = "# PowerAuger Auto-Loader`nImport-Module '$moduleManifestPath'"
 
     if ($profileContent -notlike "*# PowerAuger Auto-Loader*") {
-        Add-Content -Path $PROFILE -Value "`n`n$loaderBlock"
-        Write-Host "✅ Added PowerAuger auto-loader to your profile." -ForegroundColor Green
-    } else {
+        Add-Content -Path $PROFILE -Value "`n`n$loaderBlock" -Force
+        Write-Host "✅ Added PowerAuger auto-loader to your profile (using absolute path)." -ForegroundColor Green
+    }
+    else {
         Write-Host "✅ PowerAuger auto-loader already exists in your profile." -ForegroundColor Green
     }
     Write-Host "   PowerAuger will now load automatically in new PowerShell sessions." -ForegroundColor White

@@ -47,12 +47,13 @@ $global:OllamaConfig = @{
     
     # Performance Settings
     Performance = @{
-        CacheTimeout          = 300
-        CacheSize             = 200
-        MaxHistoryLines       = 1000
-        RecentTargetsCount    = 30
-        SessionCleanupMinutes = 30
-        EnableDebug           = $false
+        CacheTimeout            = 300
+        CacheSize               = 200
+        MaxHistoryLines         = 1000
+        RecentTargetsCount      = 30
+        SessionCleanupMinutes   = 30
+        EnableDebug             = $false
+        EnablePredictionLogging = $false # Default to off, can be enabled in config.json
     }
 }
 
@@ -114,20 +115,28 @@ function Load-PowerAugerState {
     }
 
     if (Test-Path $global:PowerAugerHistoryFile) {
-        try { $global:CommandHistory = Get-Content -Path $global:PowerAugerHistoryFile -Raw | ConvertFrom-Json } catch { }
+        try { $global:CommandHistory = Get-Content -Path $global:PowerAugerHistoryFile -Raw | ConvertFrom-Json } catch {
+            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse history.json: $($_.Exception.Message)" }
+        }
     }
     if (Test-Path $global:PowerAugerCacheFile) {
-        try { $global:PredictionCache = Get-Content -Path $global:PowerAugerCacheFile -Raw | ConvertFrom-Json -AsHashtable } catch { }
+        try { $global:PredictionCache = Get-Content -Path $global:PowerAugerCacheFile -Raw | ConvertFrom-Json -AsHashtable } catch {
+            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse cache.json: $($_.Exception.Message)" }
+        }
     }
     if (Test-Path $global:PowerAugerTargetsFile) {
-        try { $global:RecentTargets = Get-Content -Path $global:PowerAugerTargetsFile -Raw | ConvertFrom-Json } catch { }
+        try { $global:RecentTargets = Get-Content -Path $global:PowerAugerTargetsFile -Raw | ConvertFrom-Json } catch {
+            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse recent_targets.json: $($_.Exception.Message)" }
+        }
     }
     if (Test-Path $global:PowerAugerLogFile) {
         try {
             $logData = Get-Content -Path $global:PowerAugerLogFile -Raw | ConvertFrom-Json
             if ($logData) { $global:PredictionLog = [System.Collections.Generic.List[object]]::new($logData) }
         }
-        catch { }
+        catch {
+            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse prediction_log.json: $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -779,6 +788,25 @@ function Add-CommandToHistory {
     Update-RecentTargets -Command $Command
 }
 
+function Clear-PowerAugerCache {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param()
+    <#
+    .SYNOPSIS
+    Clears the in-memory prediction cache and deletes the cache file from disk.
+    #>
+
+    if ($pscmdlet.ShouldProcess("the prediction cache in memory and on disk ($($global:PowerAugerCacheFile))")) {
+        $global:PredictionCache.Clear()
+        if (Test-Path $global:PowerAugerCacheFile) {
+            try {
+                Remove-Item -Path $global:PowerAugerCacheFile -Force -ErrorAction Stop
+                Write-Host "✅ Prediction cache file removed." -ForegroundColor Green
+            } catch { Write-Warning "Failed to remove cache file: $($_.Exception.Message)" }
+        }
+        Write-Host "✅ In-memory prediction cache cleared." -ForegroundColor Green
+    }
+}
 # --------------------------------------------------------------------------------------------------------
 # PERFORMANCE MONITORING AND DIAGNOSTICS
 # --------------------------------------------------------------------------------------------------------
@@ -830,6 +858,10 @@ function Show-PredictorStatus {
     Write-Host "Cache Hit Rate: $($stats.Cache.HitRate)%" -ForegroundColor White
     Write-Host "Average Latency: $([math]::Round($stats.Performance.AverageLatency, 0))ms" -ForegroundColor White
     Write-Host "Success Rate: $([math]::Round($stats.Performance.SuccessRate * 100, 1))%" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Models:" -ForegroundColor White
+    Write-Host "  - Fast:    $($global:OllamaConfig.Models.FastCompletion.Name)" -ForegroundColor Gray
+    Write-Host "  - Context: $($global:OllamaConfig.Models.ContextAware.Name)" -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -967,7 +999,9 @@ Export-ModuleMember -Function @(
     'Test-OllamaConnection',
     'Show-PredictorStatus',
     'Get-PredictorStatistics',
-    'Get-PredictionLog' # NEW
+    'Get-PredictionLog', # NEW
+    'Save-PowerAugerState',
+    'Clear-PowerAugerCache' # NEW
 )
 
 # Auto-initialize if not in module development mode
