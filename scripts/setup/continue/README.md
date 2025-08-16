@@ -1,79 +1,109 @@
-<!-- @format -->
-
-# PowerAuger - Experimental AI Command Predictor for PowerShell
+# PowerAuger - Intelligent AI Command Predictor for PowerShell
 
 <p align="center">
   <img src="https://i.imgur.com/O1lO3rA.png" alt="PowerAuger Logo" width="200"/>
 </p>
 
-> **⚠️ Experimental Software Notice ⚠️**
+> **🚀 Production-Ready AI Shell Assistant**
 >
-> PowerAuger is currently under active, rapid development. It is a proving ground for cutting-edge command-line AI assistance. Features may change, APIs may be refactored, and you may encounter bugs. Use with a spirit of adventure and help shape its future!
+> PowerAuger v3.4.0+ is a mature, production-grade command predictor with intelligent model selection, advanced context awareness, and comprehensive tunnel management. Designed for both local development and enterprise remote AI deployment.
 
-**PowerAuger** is an intelligent, context-aware command predictor for PowerShell, designed to transform your shell into a proactive assistant. Powered by local or remote [Ollama](https://ollama.com/) models, it goes far beyond simple history-based suggestions to provide completions that understand your environment, intent, and workflow.
+**PowerAuger** is an intelligent, context-aware command predictor for PowerShell, designed to transform your shell into a proactive assistant. Powered by local or remote [Ollama](https://ollama.com/) models, it provides completions that understand your environment, intent, and workflow.
 
----
+## Project Structure
 
-## Core Features (What's Here Today)
-
-Even in its experimental stage, PowerAuger is built on a production-grade foundation:
-
--   **🚀 Guided, Automated Setup**: A comprehensive `setup.ps1` script handles everything from initial configuration and connection testing to model auto-detection and profile setup.
--   **🔐 Secure Remote Connections**: Built-in SSH tunnel management for securely connecting to a remote Ollama instance, keeping your models and data firewalled.
--   **🧠 Stateful & Persistent**: Remembers your configuration, command history, and prediction cache across sessions, storing its state neatly in `~/.PowerAuger`.
--   **🤖 Intelligent Model Selection**: Automatically switches between a fast, lightweight model for simple completions and a powerful, context-aware model for complex commands, optimizing for both speed and accuracy.
--   **🧩 Modular Context Engine**: The engine understands your environment. It knows your current directory, whether you're in a Git repository (and if it's dirty), and the structure of the command you're typing.
--   **⚡ Robust Caching**: Reduces latency and API calls with an intelligent, time-aware cache, providing instant suggestions for repeated commands.
--   **📊 Full Diagnostics**: A suite of commands (`Show-PredictorStatus`, `Get-PredictorStatistics`, `Clear-PowerAugerCache`) to monitor and manage the engine's health and performance.
-
-## Vision & Roadmap (What's Coming Next)
-
-PowerAuger aims to be the most intelligent shell assistant available. The architecture is designed to support a future that is deeply integrated and contextually brilliant. The following strategic initiatives are planned to elevate PowerAuger's intelligence and performance to the next level, organized by implementation timeline.
-
-### Short-Term Goals (Next Minor Releases)
-
--   **Model Pre-warming & State Tracking**: Eliminate "first-use" latency by intelligently pre-loading the fast and context models at startup. The engine will track which models are active in memory to optimize resource usage.
--   **Return to JSON-First Reliability (Phase 1)**: Begin the transition back to a structured JSON-first approach by enhancing model prompts and providing few-shot examples to ensure reliable, parsable output. This enables more robust error handling and richer data exchange with the models.
--   **SSH Tunnel Robustness**: Improve the stability of the background SSH tunnel by using industry-standard flags (`ssh -f`).
-
-### Mid-Term Goals (v4.0 Major Release)
-
--   **Dynamic Prompt Enrichment**: Transform the prompt from a static query into a dynamic conversation. The engine will feed recently accepted suggestions back into new prompts, teaching the model about the user's immediate workflow and dramatically improving the relevance of its predictions.
--   **Persistent Project-Level Context**: Go beyond reactive context by creating persistent, file-based context for specific projects. PowerAuger will learn about your most-used files, commands, and patterns within a repository and use that knowledge to inform future suggestions.
-
-### Long-Term Goals (Beyond v4.0)
-
--   **Asynchronous Prediction Pipeline**: Decouple the UI from the AI. The predictor will provide instantaneous history-based suggestions while a background process gathers deep context and queries the model, seamlessly updating the suggestions when ready. This will create a truly non-blocking, fluid user experience.
-
----
-
----
-
-## Installation
-
-1.  Clone this repository to your local machine.
-2.  Navigate to the `PowerAuger` module directory in PowerShell.
-3.  Run the setup script:
-    ```powershell
-    .\setup.ps1
-    ```
-4.  Follow the on-screen prompts. The script will guide you through configuring your Ollama host, testing the connection, and setting up your PowerShell profile to auto-load the module.
-
-## Basic Usage
-
-Once the setup is complete, the predictor must be enabled in `PSReadLine`. The setup script provides this command, but you can run it manually:
-
-```powershell
-# Enable predictions from your history and from PowerAuger
-Set-PSReadLineOption -PredictionSource HistoryAndPlugin
+```
+PowerAuger/
+├── src/                           # Core PowerAuger module
+│   ├── PowerAuger.psm1           # Main prediction engine (3000+ lines)
+│   ├── PowerAuger.psd1           # Module manifest v3.4.0
+│   └── PowerAuger.mermaid        # Architecture diagram
+├── scripts/                       # Setup and configuration scripts
+│   └── setup/
+│       ├── setup.ps1             # Main setup script
+│       └── continue/             # Continue IDE integration
+│           ├── New-ContinueConfiguration.ps1  # Config generator
+│           ├── README.md         # This file
+│           └── CLAUDE.md         # Development documentation
+├── tests/                        # Testing and benchmarking
+│   └── integration/
+│       ├── Benchmark-PowerAuger.ps1
+│       ├── Daily-PowerAuger-Tests.ps1
+│       └── Test-PowerAugerTracking.ps1
+├── legacy/                       # Historical components
+│   ├── modelfiles/              # Previous Ollama model definitions
+│   ├── OllamaCommandPredictor/  # Legacy predictor module
+│   └── OllamaTunnelMonitor-Backup/
+└── [config/, docs/, modelfiles/, rules/, templates/]  # Planned directories
 ```
 
-Now, simply start typing in your PowerShell terminal, and suggestions will appear automatically.
+## Core Features
+
+-   **🚀 Guided Setup**: Comprehensive `setup.ps1` script with auto-configuration and testing
+-   **🔐 SSH Tunnel Management**: Secure remote Ollama connections with background process monitoring
+-   **🧠 Persistent State**: Configuration and cache stored in `~/.PowerAuger/`
+-   **🤖 Intelligent Model Selection**: Fast vs context-aware model switching based on complexity
+-   **🧩 Advanced Context Engine**: Git status, file awareness, environment detection
+-   **⚡ Performance Caching**: TTL-based intelligent caching with size management
+-   **📊 Comprehensive Metrics**: Acceptance tracking, error monitoring, performance analytics
+-   **🔧 OllamaTunnelMonitor**: Standalone tunnel monitoring with real-time dashboard
+
+## Roadmap & Next Steps
+
+### Immediate Priorities
+
+-   **🔄 Continue Integration**: Reintegrate Continue IDE as a config.json generator with updated modelfiles
+-   **📝 Model Strategy Decision**: Evaluate current models and determine minimal modelfile requirements
+-   **🔄 Dynamic Prompt Building**: Implement adaptive prompt construction for active models
+-   **📡 TunnelMonitor Development**: Complete standalone tunnel monitoring module
+-   **📋 Configuration Management**: Streamline model and connection configuration
+
+### Short-Term Goals (v3.5.x)
+
+-   **JSON-First Reliability**: Enhanced structured output with few-shot examples
+-   **Model Pre-warming**: Eliminate first-use latency with background model loading
+-   **SSH Robustness**: Industry-standard tunnel flags and connection stability
+-   **Dynamic Context**: Real-time environment and workflow adaptation
+
+### Mid-Term Goals (v4.0)
+
+-   **Workflow Learning**: Feed accepted suggestions back to improve relevance
+-   **Project Context**: Persistent, file-based context for repository-specific intelligence
+-   **Pattern Recognition**: Advanced user behavior analysis and prediction
+
+### Long-Term Vision
+
+-   **Asynchronous Pipeline**: Non-blocking UI with background processing
+-   **Real-time Updates**: Seamless suggestion updates without interruption
+-   **Enterprise Integration**: Advanced remote deployment and management features
+
+## Installation & Setup
+
+1. Clone the repository
+2. Navigate to the project root
+3. Run the setup script:
+   ```powershell
+   .\scripts\setup\setup.ps1
+   ```
+4. Follow guided configuration for Ollama host, SSH tunnels, and model selection
+5. Enable PSReadLine integration:
+   ```powershell
+   Set-PSReadLineOption -PredictionSource HistoryAndPlugin
+   ```
 
 ## Key Commands
 
--   `Show-PredictorStatus`: Display the current connection status, model configuration, and basic stats.
--   `Get-PredictorStatistics`: Get a detailed hashtable of performance and cache metrics.
--   `Set-PredictorConfiguration`: Modify core settings like the Ollama host or debug mode.
--   `Clear-PowerAugerCache`: Manually clear the in-memory and on-disk prediction cache.
--   `Test-OllamaConnection`: Manually test the SSH tunnel and API connectivity.
+-   `Show-PredictorStatus`: Connection status, model configuration, and stats
+-   `Get-PredictorStatistics`: Detailed performance and cache metrics
+-   `Set-PredictorConfiguration`: Modify Ollama host, debug mode, and settings
+-   `Clear-PowerAugerCache`: Clear prediction cache
+-   `Test-OllamaConnection`: Manual connectivity testing
+
+## Continue IDE Integration
+
+The Continue IDE integration has been reorganized as a configuration generator:
+
+- **Location**: `scripts/setup/continue/`
+- **Purpose**: Generate `config.json` files for Continue IDE with PowerAuger-compatible models
+- **Status**: Needs updating for new model strategy and project structure
+- **Script**: `New-ContinueConfiguration.ps1` generates IDE-compatible configurations
