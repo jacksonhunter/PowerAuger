@@ -1,7 +1,0 @@
-{
-    "MaxSuggestions": 10,
-    "EnableHistoryFallback": true,
-    "ModelTimeout": 5000,
-    "CacheSize": 100,
-    "EnableSmartDefaults": true
-}
