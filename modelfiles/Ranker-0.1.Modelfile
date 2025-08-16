@@ -1,11 +1,40 @@
 # Base model from the user's specification.
 FROM dengcao/Qwen3-Reranker-4B:Q4_K_M
 
-# Reranking requires enough context to hold both the query and the document being assessed.
-# 8192 (8k) tokens is a robust default, well within the model's 32k capability.
+# Optimized parameters for consistent, deterministic evaluation
+PARAMETER temperature 0.0
+PARAMETER top_k 1
+PARAMETER top_p 1.0
 PARAMETER num_ctx 8192
+PARAMETER num_predict 80
+PARAMETER repeat_penalty 1.0
+PARAMETER seed 42
 
-# The template and system prompt for rerankers are highly task-specific and are best
-# provided dynamically via the API. A minimal template ensures maximum flexibility.
+# JSON-specific stop tokens for clean evaluation responses
+PARAMETER stop "}"
+PARAMETER stop "}]"
+PARAMETER stop "```"
+PARAMETER stop "END"
+
+# Evaluation-focused template and system prompt for consistent PowerShell completion ranking
 TEMPLATE """{{.Prompt }}"""
-SYSTEM """"""
+SYSTEM """You are a relevance scoring engine for PowerShell command completions. Evaluate how well a completion matches the given query and context.
+Score based on: syntax correctness, contextual appropriateness, intent alignment, and practical utility.
+Be precise and consistent in your evaluations. Higher scores indicate better matches.
+
+ALWAYS respond with valid JSON using this exact schema:
+{
+  "relevance_score": 0.87,
+  "ranking_factors": {
+    "syntax_validity": 0.9,
+    "context_match": 0.85,
+    "intent_alignment": 0.88,
+    "practical_utility": 0.86
+  },
+  "recommendation": "high_relevance|medium_relevance|low_relevance",
+  "reasoning": "brief explanation of scoring rationale"
+}
+
+Scoring scale: 0.0-1.0 (higher = better match)
+Be consistent and precise in your evaluations.
+Never include explanations outside the JSON structure."""

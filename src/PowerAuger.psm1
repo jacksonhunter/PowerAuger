@@ -592,11 +592,9 @@ function Update-RecentTargets {
 function Invoke-OllamaCompletion {
     [CmdletBinding()]
     param(
-        [string]$Model,
-        [string]$Prompt,
-        [hashtable]$Context = @{},
-        [int]$TimeoutMs = 5000,
-        [switch]$UseJSON = $false  # Changed default to false since your models output text
+        [hashtable]$RequestPayload,         # Complete API payload from prompt builders
+        [string]$Endpoint = "/api/chat",    # API endpoint (/api/chat or /api/generate)
+        [int]$TimeoutMs = 30000            # Request timeout in milliseconds
     )
     
     if (-not (Test-OllamaConnection)) {
@@ -606,134 +604,209 @@ function Invoke-OllamaCompletion {
     $global:PerformanceMetrics.RequestCount++
     $startTime = Get-Date
     
-    # Build enhanced prompt with context using model-specific format
-    $enhancedPrompt = Build-ContextualPrompt -BasePrompt $Prompt -Context $Context -ModelName $Model
-    
-    # Get model config for the specific model being used
-    $modelConfig = $null
-    if ($Model -eq $global:OllamaConfig.Models.FastCompletion.Name) {
-        $modelConfig = $global:OllamaConfig.Models.FastCompletion
-    }
-    elseif ($Model -eq $global:OllamaConfig.Models.ContextAware.Name) {
-        $modelConfig = $global:OllamaConfig.Models.ContextAware
-    }
-    else {
-        # Default to fast completion settings
-        $modelConfig = $global:OllamaConfig.Models.FastCompletion
-    }
-    
     try {
-        $requestBody = @{
-            model    = $Model
-            messages = @(@{
-                    role    = "user"
-                    content = $enhancedPrompt
-                })
-            stream   = $false
-            options  = @{
-                temperature = $modelConfig.Temperature
-                top_p       = $modelConfig.TopP
-                num_predict = $modelConfig.MaxTokens
-            }
-        }
-        
-        # Your models output line-separated text, not JSON
-        # Remove JSON format requirement
-        
+        # Execute the complete request payload as provided by prompt builders
         $job = Start-Job -ScriptBlock {
-            param($apiUrl, $requestBodyJson)
+            param($apiUrl, $endpoint, $requestBodyJson, $timeoutSec)
             try {
-                Invoke-RestMethod -Uri "$apiUrl/api/chat" -Method Post -Body $requestBodyJson -ContentType 'application/json' -TimeoutSec 30
+                $uri = "$apiUrl$endpoint"
+                Invoke-RestMethod -Uri $uri -Method Post -Body $requestBodyJson -ContentType 'application/json' -TimeoutSec $timeoutSec
             }
             catch {
-                @{ error = $_.Exception.Message }
+                @{ 
+                    error = $_.Exception.Message
+                    status_code = if ($_.Exception.Response) { $_.Exception.Response.StatusCode } else { "Unknown" }
+                    endpoint = $endpoint
+                }
             }
-        } -ArgumentList $global:OllamaConfig.Server.ApiUrl, ($requestBody | ConvertTo-Json -Depth 10)
+        } -ArgumentList $global:OllamaConfig.Server.ApiUrl, $Endpoint, ($RequestPayload | ConvertTo-Json -Depth 10), ($TimeoutMs / 1000)
         
         $result = $null
-        if (Wait-Job $job -Timeout ($TimeoutMs / 1000)) {
+        if (Wait-Job $job -Timeout ($TimeoutMs / 1000 + 5)) {  # Add 5s buffer for job overhead
             $result = Receive-Job $job
+        }
+        else {
+            # Job timed out
+            Remove-Job $job -Force
+            throw "Ollama request timed out after $($TimeoutMs)ms"
         }
         
         Remove-Job $job -Force
         
-        if ($result -and -not $result.error -and $result.message) {
-            $latency = ((Get-Date) - $startTime).TotalMilliseconds
-            $global:PerformanceMetrics.AverageLatency = ($global:PerformanceMetrics.AverageLatency + $latency) / 2
+        # Update performance metrics
+        $latency = ((Get-Date) - $startTime).TotalMilliseconds
+        $global:PerformanceMetrics.AverageLatency = ($global:PerformanceMetrics.AverageLatency + $latency) / 2
+        
+        if ($result -and -not $result.error) {
+            # Success
             $global:PerformanceMetrics.SuccessRate = ($global:PerformanceMetrics.SuccessRate * 0.95) + 0.05
             
-            $responseContent = $result.message.content
-            
-            # Your models output line-separated commands, not JSON
-            # Parse as line-separated text
-            $completions = $responseContent -split "`n" | 
-            Where-Object { $_.Trim() -and $_ -notmatch '^(INPUT:|OUTPUT:|CONTEXT:|SUGGESTIONS:)' } |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ }
-            
-            # Return in consistent format for PowerAuger
+            # Return raw response - let callers handle parsing
             return @{
-                completions = $completions
-                confidence  = 0.9
-                context     = "model_native_format"
+                response = $result
+                latency_ms = $latency
+                endpoint = $Endpoint
+                model = $RequestPayload.model
+                success = $true
             }
         }
-        
-        # Update failure metrics
-        $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
-        throw "Ollama request failed or timed out"
+        else {
+            # API returned an error
+            $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
+            
+            $errorMsg = if ($result.error) { $result.error } else { "Unknown API error" }
+            throw "Ollama API error: $errorMsg"
+        }
     }
     catch {
+        # Update failure metrics
+        $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
+        
         if ($global:OllamaConfig.Performance.EnableDebug) {
             Write-Host "⚠️ Ollama request failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            if ($RequestPayload.model) {
+                Write-Host "   Model: $($RequestPayload.model), Endpoint: $Endpoint" -ForegroundColor Gray
+            }
         }
         throw
     }
 }
 
-function Build-ContextualPrompt {
+function Build-AutocompletePrompt {
     [CmdletBinding()]
-    param([string]$BasePrompt, [hashtable]$Context, [string]$ModelName)
+    param(
+        [string]$InputLine,
+        [hashtable]$Context = @{},
+        [string]$ModelName = "powershell-fast:latest"
+    )
     
-    # Build prompt based on model template
-    if ($ModelName -like "*fast*") {
-        # Fast model template: "INPUT: {{ .Prompt }}"
-        return "INPUT: $BasePrompt"
+    # Simple, focused prompt for immediate completion
+    $userPrompt = "Complete: $InputLine"
+    
+    # Streamlined API payload - modelfile handles system prompt, parameters, and JSON format
+    return @{
+        model = $ModelName
+        messages = @(
+            @{ role = "user"; content = $userPrompt }
+        )
+        format = "json"
+        stream = $true
+        keep_alive = "30s"
     }
-    elseif ($ModelName -like "*context*") {
-        # Context model template: "CONTEXT: pwd=..., files=[...], command=..."
-        $contextParts = @()
-        
-        # Add directory
-        if ($Context.Environment.Directory) {
-            $contextParts += "pwd=$($Context.Environment.Directory)"
-        }
-        
-        # Add git status if in repo
-        if ($Context.Environment.IsGitRepo) {
-            $contextParts += "git_status=$($Context.Environment.GitChanges)_changes"
-        }
-        
-        # Add files in directory
-        if ($Context.Environment.FilesInDirectory) {
-            $fileList = $Context.Environment.FilesInDirectory | ForEach-Object { "*.$($_ -split '\.' | Select-Object -Last 1)" } | Select-Object -Unique | Select-Object -First 5
-            $contextParts += "files=[$($fileList -join ', ')]"
-        }
-        
-        # Add recent success patterns (simplified)
-        if ($global:RecentTargets) {
-            $recentCommands = $global:RecentTargets | ForEach-Object { Split-Path $_ -Leaf } | Select-Object -First 3
-            $contextParts += "recent_success=[$($recentCommands -join ', ')]"
-        }
-        
-        # Add the command being completed
-        $contextParts += "command=$BasePrompt"
-        
-        return "CONTEXT: $($contextParts -join ', ')"
+}
+
+function Build-CoderPrompt {
+    [CmdletBinding()]
+    param(
+        [string]$InputLine,
+        [hashtable]$Context = @{},
+        [string]$ModelName = "powershell-context:latest"
+    )
+    
+    # Build rich contextual information for sophisticated analysis
+    $contextParts = @()
+    
+    # Add directory context
+    if ($Context.Environment.Directory) { 
+        $contextParts += "Directory: $($Context.Environment.Directory)" 
     }
-    else {
-        # Default to fast model format
-        return "INPUT: $BasePrompt"
+    
+    # Add git context if available
+    if ($Context.Environment.IsGitRepo) { 
+        $contextParts += "Git: $($Context.Environment.GitBranch) ($($Context.Environment.GitChanges) changes)" 
+    }
+    
+    # Add file context
+    if ($Context.Environment.FilesInDirectory) { 
+        $fileTypes = $Context.Environment.FilesInDirectory | 
+                     ForEach-Object { "*." + ($_ -split '\.')[-1] } | 
+                     Select-Object -Unique -First 5
+        $contextParts += "Files: [$($fileTypes -join ', ')]"
+    }
+    
+    # Add elevation status
+    if ($Context.Environment.IsElevated) {
+        $contextParts += "PowerShell: Elevated"
+    }
+    
+    # Add recent command patterns
+    if ($global:RecentTargets) {
+        $recentCommands = $global:RecentTargets | 
+                         ForEach-Object { Split-Path $_ -Leaf } | 
+                         Select-Object -First 3
+        $contextParts += "Recent: [$($recentCommands -join ', ')]"
+    }
+    
+    # Add parsed command context if available
+    if ($Context.ParsedCommand) {
+        $contextParts += "Command: $($Context.ParsedCommand.Name) ($($Context.ParsedCommand.Type))"
+        if ($Context.ParsedCommand.Arguments) {
+            $contextParts += "Args: [$($Context.ParsedCommand.Arguments -join ', ')]"
+        }
+    }
+    
+    $userPrompt = @"
+Context: $($contextParts -join ' | ')
+Input: $InputLine
+
+Analyze the context and provide sophisticated PowerShell command suggestions with detailed explanations.
+"@
+    
+    # Streamlined payload - modelfile handles system prompt, parameters, and JSON format
+    return @{
+        model = $ModelName
+        messages = @(
+            @{ role = "user"; content = $userPrompt }
+        )
+        format = "json"
+        stream = $true
+        options = @{
+            num_ctx = 16384     # Override for large context when needed
+        }
+        keep_alive = "5m"
+    }
+}
+
+function Build-RankerPrompt {
+    [CmdletBinding()]
+    param(
+        [string]$Query,
+        [string]$Completion,
+        [hashtable]$Context = @{},
+        [string]$ModelName = "qwen3-reranker:latest"
+    )
+    
+    # Build context summary for evaluation
+    $contextSummary = @()
+    if ($Context.Environment.Directory) { 
+        $contextSummary += "Dir: $($Context.Environment.Directory)" 
+    }
+    if ($Context.Environment.IsGitRepo) { 
+        $contextSummary += "Git: $($Context.Environment.GitBranch)" 
+    }
+    if ($Context.Environment.FilesInDirectory) { 
+        $contextSummary += "Files: $($Context.Environment.FilesInDirectory.Count)" 
+    }
+    if ($Context.Environment.IsElevated) {
+        $contextSummary += "Elevated: Yes"
+    }
+    
+    # Structured evaluation prompt
+    $evaluationPrompt = @"
+Query: "$Query"
+Completion: "$Completion"
+Context: $($contextSummary -join ', ')
+
+Evaluate the relevance and quality of this PowerShell completion.
+"@
+    
+    # Streamlined payload for precise evaluation - modelfile handles system prompt and parameters
+    return @{
+        model = $ModelName
+        prompt = $evaluationPrompt      # Use generate endpoint for efficiency
+        format = "json"
+        stream = $false                 # Ranking needs complete response for accuracy
+        keep_alive = "1m"
     }
 }
 

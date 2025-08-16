@@ -14,10 +14,14 @@ PARAMETER top_k 10
 PARAMETER top_p 0.9
 PARAMETER repeat_penalty 1.1
 
-# Qwen-specific stop tokens to ensure the model stops after the completion.
+# Comprehensive stop tokens for clean JSON completion
 PARAMETER stop "<|im_start|>"
 PARAMETER stop "<|im_end|>"
 PARAMETER stop "<|endoftext|>"
+PARAMETER stop "}"
+PARAMETER stop "}]"
+PARAMETER stop "```"
+PARAMETER stop "END"
 
 # Standard Qwen instruct template.
 TEMPLATE """<|im_start|>system
@@ -27,5 +31,22 @@ TEMPLATE """<|im_start|>system
 <|im_start|>assistant
 """
 
-# A highly directive system prompt tailored for autocomplete.
-SYSTEM """You are a code completion assistant. Complete the given code snippet or command. Respond ONLY with the completion text. Do not add any explanation, formatting, or conversational filler."""
+# JSON-first system prompt optimized for PowerShell autocomplete with strict schema
+SYSTEM """You are a PowerShell autocomplete engine. Provide immediate command completions for the given input.
+Focus on exact cmdlet matches, parameter completions, and common patterns. Be fast and precise.
+
+ALWAYS respond with valid JSON using this exact schema:
+{
+  "completions": [
+    {
+      "text": "command or completion text",
+      "confidence": 0.95,
+      "type": "cmdlet|parameter|path|variable|alias",
+      "partial_match": true
+    }
+  ]
+}
+
+Types: cmdlet, parameter, path, variable, alias
+Confidence: 0.0-1.0 (higher = more certain)
+Never include explanations, markdown, or text outside the JSON structure."""
