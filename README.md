@@ -21,6 +21,11 @@
 ### 🎯 **Advanced Context Intelligence**
 - **Environment Awareness**: Git status, file structure, elevation, and directory context
 - **Command Analysis**: Parse cmdlets, parameters, and intent for sophisticated suggestions
+- **Smart Defaults**: Success/failure tracking with command pattern recognition
+- **Directory Patterns**: Project-type detection (Node.js, Python, .NET, PowerShell)
+- **Error Learning**: Recent error analysis for proactive suggestion improvement
+- **Module Context**: Available commands and recently imported modules
+- **@ Trigger System**: Context injection with `@files`, `@git`, `@history`, `@env`
 - **Recent Pattern Learning**: Track successful commands for improved relevance
 - **Project Context**: Repository-specific intelligence and workflow adaptation
 
@@ -114,6 +119,12 @@ Get-Ch[TAB] → Get-ChildItem
 # Complex completions use context-aware coder model  
 Get-ChildItem C:\Projects -Recurse -Filter *.ps1 | Where-Object[TAB]
 → Get-ChildItem C:\Projects -Recurse -Filter *.ps1 | Where-Object { $_.Length -gt 1KB }
+
+# @ Trigger system for context injection
+@files[TAB] → Lists all files in current directory for selection
+@git[TAB] → Shows git branch, status, and recent commits
+@history[TAB] → Recent command history for pattern matching
+@env[TAB] → Environment context (SSH, elevation, PowerShell version)
 ```
 
 ### Performance Monitoring
@@ -216,22 +227,27 @@ $global:OllamaConfig.Performance.EnablePredictionLogging = $true
 - 🔄 **Fuzzy Logic**: Advanced keystroke matching and confidence scoring
 
 ### Next Phase: Streaming Intelligence (v4.1)
-- **Real-Time Context Daemon**: Background environment monitoring
-- **Completion Queue Management**: Handle 512+ completions efficiently  
-- **Dynamic Confidence Scoring**: Time-based and pattern-based relevance
-- **Advanced Filtering**: Multi-stage completion refinement pipeline
+- **Real-Time Context Daemon**: Background environment monitoring with change detection
+- **Completion Queue Management**: Handle 512+ completions efficiently with priority scoring
+- **Dynamic Confidence Scoring**: Time-based and pattern-based relevance with keystroke decay
+- **Advanced Filtering**: Multi-stage completion refinement pipeline with fuzzy logic
+- **Model Pre-warming**: Eliminate first-use latency with intelligent background loading
+- **Dynamic Prompt Enrichment**: Feed accepted suggestions back to models for workflow learning
 
 ### Future Vision: Enterprise Integration (v5.0)
-- **Workflow Learning**: Feed accepted suggestions back to improve models
+- **Asynchronous Prediction Pipeline**: Non-blocking UI with seamless background processing
+- **Persistent Project-Level Context**: File-based context storage for repository-specific intelligence
+- **Workflow Learning**: Advanced pattern recognition and user behavior adaptation
 - **Team Intelligence**: Shared knowledge base across development teams
 - **Repository Context**: Deep integration with project structures and patterns
 - **Scalable Architecture**: Support for high-concurrency enterprise deployment
 
 ### Long-Term Goals
-- **Asynchronous Pipeline**: Non-blocking UI with background processing
-- **Custom Model Training**: Fine-tune models on team-specific patterns
-- **Advanced Analytics**: Detailed insights into development workflow efficiency
-- **Multi-Language Support**: Extend beyond PowerShell to other shells and languages
+- **Custom Model Training**: Fine-tune models on organization-specific patterns
+- **Advanced Analytics**: Detailed insights into development workflow efficiency and AI effectiveness
+- **Multi-Language Support**: Extend beyond PowerShell to Bash, Zsh, and other shells
+- **Enterprise Dashboard**: Team productivity metrics and AI assistance effectiveness
+- **Real-Time Collaboration**: Shared context and suggestions across team members
 
 ## 🤝 Contributing
 

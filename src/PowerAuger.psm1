@@ -513,6 +513,139 @@ function _Get-GitContext {
     }
 }
 
+function _Get-SmartDefaultsContext {
+    param([hashtable]$Context)
+    
+    # Update smart defaults cache periodically (every 5 minutes)
+    $now = Get-Date
+    if (($now - $global:SmartDefaults.LastCacheUpdate).TotalMinutes -ge 5) {
+        try {
+            # Update recent commands with success/failure tracking
+            $recentHistory = Get-History -Count 50 -ErrorAction SilentlyContinue
+            $global:SmartDefaults.RecentCommands = $recentHistory | ForEach-Object {
+                @{
+                    Command   = $_.CommandLine
+                    Timestamp = $_.StartExecutionTime
+                    Success   = $null -ne $_.EndExecutionTime -and $_.ExecutionStatus -eq 'Completed'
+                    Duration  = if ($_.EndExecutionTime) { ($_.EndExecutionTime - $_.StartExecutionTime).TotalMilliseconds } else { $null }
+                }
+            }
+            
+            $global:SmartDefaults.LastCacheUpdate = $now
+        }
+        catch {
+            # Ignore cache update errors
+        }
+    }
+    
+    # Add smart defaults to context
+    $Context.SmartDefaults = @{
+        RecentSuccessfulCommands = $global:SmartDefaults.RecentCommands | Where-Object { $_.Success } | Select-Object -First 10
+        RecentFailedCommands     = $global:SmartDefaults.RecentCommands | Where-Object { -not $_.Success } | Select-Object -First 5
+        FastCommands            = $global:SmartDefaults.RecentCommands | Where-Object { $_.Duration -lt 1000 } | Select-Object -First 5
+    }
+}
+
+function _Get-DirectoryPatternContext {
+    param([hashtable]$Context)
+    
+    $currentDir = $Context.Environment.Directory
+    if (-not $global:SmartDefaults.DirectoryPatterns.ContainsKey($currentDir)) {
+        $global:SmartDefaults.DirectoryPatterns[$currentDir] = @()
+    }
+    
+    # Detect directory type and common patterns
+    $directoryType = "unknown"
+    $commonPatterns = @()
+    
+    # Check for project indicators
+    if (Test-Path (Join-Path $currentDir "package.json")) { 
+        $directoryType = "nodejs"
+        $commonPatterns = @("npm", "yarn", "node")
+    }
+    elseif (Test-Path (Join-Path $currentDir "requirements.txt") -or (Get-ChildItem "*.py" -ErrorAction SilentlyContinue)) { 
+        $directoryType = "python"
+        $commonPatterns = @("python", "pip", "pytest")
+    }
+    elseif (Test-Path (Join-Path $currentDir "*.csproj") -or (Test-Path (Join-Path $currentDir "*.sln"))) { 
+        $directoryType = "dotnet"
+        $commonPatterns = @("dotnet", "msbuild")
+    }
+    elseif (Get-ChildItem "*.ps1" -ErrorAction SilentlyContinue) { 
+        $directoryType = "powershell"
+        $commonPatterns = @("Test-Path", "Get-ChildItem", "Import-Module")
+    }
+    
+    $Context.DirectoryPattern = @{
+        Type = $directoryType
+        CommonCommands = $commonPatterns
+        PreviousCommands = $global:SmartDefaults.DirectoryPatterns[$currentDir]
+    }
+}
+
+function _Get-ErrorHistoryContext {
+    param([hashtable]$Context)
+    
+    # Get recent PowerShell errors
+    $recentErrors = Get-Variable Error -ValueOnly -ErrorAction SilentlyContinue | Select-Object -First 5
+    
+    $Context.ErrorHistory = @{
+        RecentErrors = $recentErrors | ForEach-Object {
+            @{
+                Message = $_.Exception.Message
+                CommandName = $_.InvocationInfo.MyCommand.Name
+                Line = $_.InvocationInfo.Line
+            }
+        }
+        FailedCommands = $global:SmartDefaults.ErrorHistory
+    }
+}
+
+function _Get-ModuleContext {
+    param([hashtable]$Context)
+    
+    $loadedModules = Get-Module | Select-Object Name, Version, ModuleType
+    $availableCommands = Get-Command | Where-Object { $_.Source } | 
+                        Group-Object Source | 
+                        Sort-Object Count -Descending | 
+                        Select-Object -First 10
+    
+    $Context.ModuleContext = @{
+        LoadedModules = $loadedModules
+        TopCommandSources = $availableCommands
+        RecentModuleImports = $global:SmartDefaults.RecentCommands | 
+                             Where-Object { $_.Command -like "Import-Module*" } | 
+                             Select-Object -First 5
+    }
+}
+
+function _Get-TriggerContext {
+    param([hashtable]$Context)
+    
+    # Check for @ triggers in input line for context injection
+    if ($Context.InputLine -match '@(\w+)\s*(.*)') {
+        $triggerName = $matches[1]
+        $triggerQuery = $matches[2].Trim()
+        
+        $Context.Trigger = @{
+            Name = $triggerName
+            Query = $triggerQuery
+            ProviderData = $null
+        }
+        
+        # Execute trigger provider if available
+        if ($global:SmartDefaults.TriggerProviders.ContainsKey($triggerName)) {
+            try {
+                $Context.Trigger.ProviderData = & $global:SmartDefaults.TriggerProviders[$triggerName]
+                $Context.HasComplexContext = $true
+            }
+            catch {
+                $Context.Trigger.ProviderData = @("Error loading $triggerName context: $($_.Exception.Message)")
+            }
+        }
+    }
+}
+
 function Get-EnhancedContext {
     [CmdletBinding()]
     param([string]$InputLine, [int]$CursorIndex = 0)
@@ -1401,15 +1534,54 @@ function Set-PredictorConfiguration {
 # EXPANSION STRATEGY HOOKS
 # --------------------------------------------------------------------------------------------------------
 
-# Context Provider Registry for future expansion
+# Context Provider Registry with enhanced providers from legacy analysis
 # This ordered dictionary defines the context providers and their execution order.
 # Each value is a scriptblock that accepts a single [hashtable]$Context parameter.
 $global:ContextProviders = [ordered]@{
-    'Environment' = { param($Context) _Get-EnvironmentContext -Context $Context }
-    'Command'     = { param($Context) _Get-CommandContext -Context $Context }
-    'FileTarget'  = { param($Context) _Get-FileTargetContext -Context $Context }
-    'Git'         = { param($Context) _Get-GitContext -Context $Context }
-    # Future providers can be added here: Azure, AWS, Docker, etc.
+    'Environment'    = { param($Context) _Get-EnvironmentContext -Context $Context }
+    'Command'        = { param($Context) _Get-CommandContext -Context $Context }
+    'FileTarget'     = { param($Context) _Get-FileTargetContext -Context $Context }
+    'Git'            = { param($Context) _Get-GitContext -Context $Context }
+    'SmartDefaults'  = { param($Context) _Get-SmartDefaultsContext -Context $Context }
+    'DirectoryPattern' = { param($Context) _Get-DirectoryPatternContext -Context $Context }
+    'ErrorHistory'   = { param($Context) _Get-ErrorHistoryContext -Context $Context }
+    'ModuleContext'  = { param($Context) _Get-ModuleContext -Context $Context }
+    'TriggerContext' = { param($Context) _Get-TriggerContext -Context $Context }
+    # Future providers: Azure, AWS, Docker, Kubernetes, etc.
+}
+
+# Smart defaults for command success tracking and pattern recognition
+$global:SmartDefaults = @{
+    CommandSuccess    = @{}    # Track which commands typically succeed
+    DirectoryPatterns = @{}    # Common command patterns per directory type  
+    RecentCommands    = @()    # Last 50 commands with success/failure tracking
+    ErrorHistory      = @()    # Commands that failed recently
+    LastCacheUpdate   = (Get-Date).AddDays(-1)
+    TriggerProviders  = @{     # @ trigger system for context injection
+        'files'   = { Get-ChildItem -Name -File | Select-Object -First 20 }
+        'dirs'    = { Get-ChildItem -Name -Directory | Select-Object -First 10 }
+        'git'     = { 
+            if (Test-Path .git) {
+                @(
+                    "Branch: $(git branch --show-current 2>$null)"
+                    "Status: $(git status --porcelain 2>$null | Measure-Object | Select-Object -ExpandProperty Count) changes"
+                    "Recent: $(git log --oneline -5 2>$null | ForEach-Object { ($_ -split ' ')[1..100] -join ' ' } | Select-Object -First 3)"
+                )
+            } else { @() }
+        }
+        'history' = { Get-History -Count 20 | Select-Object -ExpandProperty CommandLine }
+        'errors'  = { $global:SmartDefaults.ErrorHistory | Select-Object -First 5 }
+        'modules' = { Get-Module | Select-Object -ExpandProperty Name | Select-Object -First 15 }
+        'env'     = { 
+            @(
+                "SSH: $($null -ne $env:SSH_CLIENT)"
+                "PWD: $(Get-Location)"
+                "User: $env:USERNAME"
+                "PS: $($PSVersionTable.PSVersion)"
+                "Elevated: $([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+            )
+        }
+    }
 }
 
 # Model Registry for easy expansion
