@@ -202,16 +202,16 @@ function Find-SSHTunnelProcess {
             
             foreach ($line in $netstatOutput) {
                 if ($line -match "TCP\s+127\.0\.0\.1:$LocalPort\s+.*\s+LISTENING\s+(\d+)") {
-                    $pid = $matches[1]
+                    $psid = $matches[1]
                     
                     # Verify this is actually an SSH process
                     try {
-                        $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                        $process = Get-Process -Id $psid -ErrorAction SilentlyContinue
                         if ($process -and ($process.ProcessName -eq "ssh" -or $process.ProcessName -eq "ssh.exe")) {
                             if ($global:OllamaConfig.Performance.EnableDebug) {
-                                Write-Host "🔍 Found SSH tunnel process: PID $pid" -ForegroundColor Cyan
+                                Write-Host "🔍 Found SSH tunnel process: PID $psid" -ForegroundColor Cyan
                             }
-                            return [int]$pid
+                            return [int]$psid
                         }
                     }
                     catch {
@@ -1269,7 +1269,8 @@ function Initialize-OllamaPredictor {
                         # Use a long timeout because model loading can be slow.
                         # The job runs in the background, so it won't block the user.
                         $null = Invoke-RestMethod -Uri "$apiUrl/api/generate" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 120 -ErrorAction Stop
-                    } catch {
+                    }
+                    catch {
                         # This is a background job, so we can't easily show warnings. The failure is non-critical.
                     }
                 } -ArgumentList $modelName, $keepAlive, $global:OllamaConfig.Server.ApiUrl, $global:OllamaConfig.Performance.EnableDebug | Out-Null

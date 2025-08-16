@@ -1,0 +1,11 @@
+# Base model from the user's specification.
+FROM dengcao/Qwen3-Reranker-4B:Q4_K_M
+
+# Reranking requires enough context to hold both the query and the document being assessed.
+# 8192 (8k) tokens is a robust default, well within the model's 32k capability.
+PARAMETER num_ctx 8192
+
+# The template and system prompt for rerankers are highly task-specific and are best
+# provided dynamically via the API. A minimal template ensures maximum flexibility.
+TEMPLATE """{{.Prompt }}"""
+SYSTEM """"""

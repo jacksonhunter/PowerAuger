@@ -1,0 +1,31 @@
+# Base model from the user's specification. 
+FROM danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-Q4_K_XL
+
+# Set a default temperature that balances creativity with logical consistency for coding tasks.
+PARAMETER temperature 0.4
+
+# Set a high but practical default context window. 32768 (32k) tokens provides a vast
+# context for most coding tasks without the extreme VRAM cost of the full 1M token window.
+# This can be overridden via the API for repository-scale analysis.
+PARAMETER num_ctx 32768
+
+# Standard sampling parameters that work well for code generation.
+PARAMETER top_k 40
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+# Define stop tokens specific to the Qwen model family to prevent run-on generation.
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# The standard chat/instruct template for Qwen models.
+TEMPLATE """<|im_start|>system
+{{.System }}<|im_end|>
+<|im_start|>user
+{{.Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+
+# A default system prompt establishing the model's core expertise.
+SYSTEM """You are an expert programmer specializing in PowerShell 7. Your responses should be concise, accurate, and directly address the user's request. When providing code, ensure it is clean, efficient, and follows best practices."""

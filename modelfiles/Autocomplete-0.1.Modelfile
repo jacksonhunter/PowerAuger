@@ -1,0 +1,31 @@
+# Base model from the official Ollama library, a reliable substitute.
+FROM Jadio/Qwen3_4b_instruct_q4km:latest
+
+# Set temperature to near-zero for deterministic, fast, and predictable completions.
+PARAMETER temperature 0.1
+
+# A smaller context window (4k) is a key optimization for speed and reduced memory
+# footprint, and is sufficient for most line-by-line autocomplete tasks.
+PARAMETER num_ctx 4096
+
+# A very low top_k value is critical for autocomplete. It restricts the model to the most
+# probable tokens, increasing speed and preventing irrelevant or overly creative suggestions.
+PARAMETER top_k 10
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+# Qwen-specific stop tokens to ensure the model stops after the completion.
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# Standard Qwen instruct template.
+TEMPLATE """<|im_start|>system
+{{.System }}<|im_end|>
+<|im_start|>user
+{{.Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+
+# A highly directive system prompt tailored for autocomplete.
+SYSTEM """You are a code completion assistant. Complete the given code snippet or command. Respond ONLY with the completion text. Do not add any explanation, formatting, or conversational filler."""
