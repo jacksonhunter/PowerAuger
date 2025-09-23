@@ -10,6 +10,11 @@
 # GLOBAL CONFIGURATION AND STATE
 # --------------------------------------------------------------------------------------------------------
 
+# Global Model Name Constants - Easy to update when model names change
+$global:AUTOCOMPLETE_MODEL = "qwen2.5-0.5B-autocomplete-custom"  # Fast autocomplete model from working example
+$global:CODER_MODEL = "llama3.2:3b"                             # Fallback to a common model that likely exists
+$global:RANKER_MODEL = "llama3.2:1b"                            # Small model for ranking if needed 
+
 $global:OllamaConfig = @{
     # Server Configuration
     Server      = @{
@@ -22,11 +27,11 @@ $global:OllamaConfig = @{
         IsConnected   = $false
         ApiUrl        = "http://localhost:11434"
     }
-    
+
     # Model Strategy - Matching your actual model parameters
     Models      = @{
         FastCompletion = @{
-            Name        = "powershell-fast:latest"
+            Name        = $global:AUTOCOMPLETE_MODEL
             UseCase     = "Quick completions <10 chars"
             KeepAlive   = "30s"
             MaxTokens   = 80
@@ -35,13 +40,22 @@ $global:OllamaConfig = @{
             Timeout     = 30000  # 30 seconds - your models need time
         }
         ContextAware   = @{
-            Name        = "powershell-context:latest"
+            Name        = $global:CODER_MODEL
             UseCase     = "Complex completions with environment"
             KeepAlive   = "5m"
             MaxTokens   = 150
             Temperature = 0.4    # Matches your Modelfile
             TopP        = 0.85   # Matches your Modelfile
             Timeout     = 30000  # 30 seconds - your models need time
+        }
+        Ranker = @{
+            Name        = $global:RANKER_MODEL
+            UseCase     = "Evaluation and scoring of completions"
+            KeepAlive   = "1m"
+            MaxTokens   = 50
+            Temperature = 0.0    # Deterministic for ranking
+            TopP        = 1.0    # No sampling for evaluation
+            Timeout     = 15000  # 15 seconds - faster evaluation
         }
     }
     
@@ -104,6 +118,10 @@ function Load-PowerAugerConfiguration {
             if (-not [string]::IsNullOrWhiteSpace($fileContent)) {
                 $loadedConfig = $fileContent | ConvertFrom-Json -AsHashtable
                 $global:OllamaConfig = Merge-Hashtables -base $global:OllamaConfig -overlay $loadedConfig
+                # Always reset runtime state on module load - tunnel needs to be re-established
+                $global:OllamaConfig.Server.IsConnected = $false
+                $global:OllamaConfig.Server.TunnelProcess = $null
+                $global:OllamaConfig.Server.TunnelProcessId = $null
             }
         }
         catch {
@@ -171,7 +189,12 @@ function Save-PowerAugerConfiguration {
             New-Item -Path $global:PowerAugerDataPath -ItemType Directory -Force | Out-Null
         }
         $configToSave = $global:OllamaConfig.Clone()
+        # Don't persist runtime state - these should be fresh on each module load
         $configToSave.Server.Remove('TunnelProcess')
+        $configToSave.Server.Remove('IsConnected')  # Fix: Don't persist connection state
+        if ($configToSave.Server.ContainsKey('TunnelProcessId')) {
+            $configToSave.Server.Remove('TunnelProcessId')  # Also don't persist PID
+        }
         $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $global:PowerAugerConfigFile -Encoding UTF8 -ErrorAction SilentlyContinue
     }
     catch {
@@ -259,13 +282,39 @@ function Find-SSHTunnelProcess {
 function Start-OllamaTunnel {
     [CmdletBinding()]
     param([switch]$Force)
-    
-    if ($global:OllamaConfig.Server.IsConnected -and -not $Force) {
-        return $true
+
+    # First, check if there's already a working tunnel
+    if (-not $Force) {
+        $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
+        if ($tunnelPid) {
+            # Found a tunnel process - test if it's actually working
+            try {
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "🔍 Found existing SSH tunnel (PID: $tunnelPid), testing connection..." -ForegroundColor Yellow
+                }
+                $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
+                if ($testResponse) {
+                    # Tunnel is working! Update our state and return
+                    $global:OllamaConfig.Server.TunnelProcessId = $tunnelPid
+                    $global:OllamaConfig.Server.IsConnected = $true
+                    if ($global:OllamaConfig.Performance.EnableDebug) {
+                        Write-Host "✅ Using existing SSH tunnel (PID: $tunnelPid)" -ForegroundColor Green
+                    }
+                    return $true
+                }
+            }
+            catch {
+                # Tunnel exists but isn't working - we'll kill it and start fresh
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "⚠️ Existing tunnel not responding, restarting..." -ForegroundColor Yellow
+                }
+            }
+        }
     }
-    
+
+    # If we get here, either no tunnel exists or it's not working - clean up and start fresh
     Stop-OllamaTunnel -Silent
-    
+
     try {
         if ($global:OllamaConfig.Performance.EnableDebug) {
             Write-Host "🔗 Starting SSH tunnel to $($global:OllamaConfig.Server.LinuxHost)" -ForegroundColor Cyan
@@ -284,7 +333,7 @@ function Start-OllamaTunnel {
         }
         
         $sshArgs += "$($global:OllamaConfig.Server.SSHUser)@$($global:OllamaConfig.Server.LinuxHost)"
-        
+
         # Start SSH with -f flag and track the resulting process
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
         $processInfo.FileName = "ssh"
@@ -294,23 +343,59 @@ function Start-OllamaTunnel {
         $processInfo.RedirectStandardError = $true
         
         $process = [System.Diagnostics.Process]::Start($processInfo)
-        $process.WaitForExit() # With -f, this should exit immediately after forking
-        Start-Sleep -Seconds 3 # Give the background process time to establish the tunnel
-        
-        # Find the actual SSH tunnel process using more reliable method
-        $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
-        
-        # Test connection
-        $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
-        
+        # Wait maximum 10 seconds for SSH to fork (with -f it should be immediate)
+        if (-not $process.WaitForExit(10000)) {
+            # SSH didn't exit in 10 seconds, kill it and throw
+            $process.Kill()
+            throw "SSH tunnel process failed to fork within 10 seconds"
+        }
+
+        # Give the forked process time to establish the tunnel and retry finding it (with 10 second timeout)
+        $tunnelPid = $null
+        $timeout = [DateTime]::Now.AddSeconds(10)
+        $retries = 5
+        for ($i = 0; $i -lt $retries; $i++) {
+            if ([DateTime]::Now -gt $timeout) {
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "⏱️ Tunnel establishment timed out after 10 seconds" -ForegroundColor Red
+                }
+                throw "SSH tunnel establishment timed out after 10 seconds"
+            }
+            Start-Sleep -Seconds 2
+            $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
+            if ($tunnelPid) {
+                break
+            }
+            if ($global:OllamaConfig.Performance.EnableDebug -and $i -eq 2) {
+                Write-Host "⏳ Waiting for tunnel to establish..." -ForegroundColor Yellow
+            }
+        }
+
+        # Test connection regardless of whether we found the PID
+        # (the tunnel might be working even if we can't find the process)
+        try {
+            $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
+        }
+        catch {
+            # Connection failed - tunnel didn't start properly
+            if ($global:OllamaConfig.Performance.EnableDebug) {
+                Write-Host "❌ Tunnel test failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+            throw
+        }
+
         if ($testResponse) {
-            # Store the tunnel process info for later cleanup
+            # Store the tunnel process info for later cleanup (might be null if we couldn't find it)
             $global:OllamaConfig.Server.TunnelProcessId = $tunnelPid
             $global:OllamaConfig.Server.TunnelProcess = $null # We don't have a direct handle
             $global:OllamaConfig.Server.IsConnected = $true
-            
+
             if ($global:OllamaConfig.Performance.EnableDebug) {
-                Write-Host "✅ SSH tunnel established in background (PID: $tunnelPid)" -ForegroundColor Green
+                if ($tunnelPid) {
+                    Write-Host "✅ SSH tunnel established in background (PID: $tunnelPid)" -ForegroundColor Green
+                } else {
+                    Write-Host "✅ SSH tunnel established (PID detection failed, but connection works)" -ForegroundColor Green
+                }
             }
             return $true
         }
@@ -394,17 +479,14 @@ function Stop-OllamaTunnel {
 }
 
 function Test-OllamaConnection {
-    if (-not $global:OllamaConfig.Server.IsConnected) {
-        return Start-OllamaTunnel
-    }
-    
     try {
         $null = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/tags" -Method Get -TimeoutSec 2 -ErrorAction Stop
+        $global:OllamaConfig.Server.IsConnected = $true
         return $true
     }
     catch {
         $global:OllamaConfig.Server.IsConnected = $false
-        return Start-OllamaTunnel
+        return $false
     }
 }
 
@@ -726,75 +808,42 @@ function Invoke-OllamaCompletion {
     [CmdletBinding()]
     param(
         [hashtable]$RequestPayload,         # Complete API payload from prompt builders
-        [string]$Endpoint = "/api/chat",    # API endpoint (/api/chat or /api/generate)
+        [string]$Endpoint = "/api/generate", # API endpoint - default to generate like working example
         [int]$TimeoutMs = 30000            # Request timeout in milliseconds
     )
-    
+
     if (-not (Test-OllamaConnection)) {
         throw "Ollama connection not available"
     }
-    
+
     $global:PerformanceMetrics.RequestCount++
     $startTime = Get-Date
-    
+
     try {
-        # Execute the complete request payload as provided by prompt builders
-        $job = Start-Job -ScriptBlock {
-            param($apiUrl, $endpoint, $requestBodyJson, $timeoutSec)
-            try {
-                $uri = "$apiUrl$endpoint"
-                Invoke-RestMethod -Uri $uri -Method Post -Body $requestBodyJson -ContentType 'application/json' -TimeoutSec $timeoutSec
-            }
-            catch {
-                @{ 
-                    error = $_.Exception.Message
-                    status_code = if ($_.Exception.Response) { $_.Exception.Response.StatusCode } else { "Unknown" }
-                    endpoint = $endpoint
-                }
-            }
-        } -ArgumentList $global:OllamaConfig.Server.ApiUrl, $Endpoint, ($RequestPayload | ConvertTo-Json -Depth 10), ($TimeoutMs / 1000)
-        
-        $result = $null
-        if (Wait-Job $job -Timeout ($TimeoutMs / 1000 + 5)) {  # Add 5s buffer for job overhead
-            $result = Receive-Job $job
-        }
-        else {
-            # Job timed out
-            Remove-Job $job -Force
-            throw "Ollama request timed out after $($TimeoutMs)ms"
-        }
-        
-        Remove-Job $job -Force
-        
+        # Direct REST call like the working example - no job needed
+        $uri = "$($global:OllamaConfig.Server.ApiUrl)$Endpoint"
+        $body = $RequestPayload | ConvertTo-Json -Depth 3
+
+        $result = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json' -TimeoutSec ($TimeoutMs / 1000)
+
         # Update performance metrics
         $latency = ((Get-Date) - $startTime).TotalMilliseconds
         $global:PerformanceMetrics.AverageLatency = ($global:PerformanceMetrics.AverageLatency + $latency) / 2
-        
-        if ($result -and -not $result.error) {
-            # Success
-            $global:PerformanceMetrics.SuccessRate = ($global:PerformanceMetrics.SuccessRate * 0.95) + 0.05
-            
-            # Return raw response - let callers handle parsing
-            return @{
-                response = $result
-                latency_ms = $latency
-                endpoint = $Endpoint
-                model = $RequestPayload.model
-                success = $true
-            }
-        }
-        else {
-            # API returned an error
-            $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
-            
-            $errorMsg = if ($result.error) { $result.error } else { "Unknown API error" }
-            throw "Ollama API error: $errorMsg"
+        $global:PerformanceMetrics.SuccessRate = ($global:PerformanceMetrics.SuccessRate * 0.95) + 0.05
+
+        # Return simplified response structure
+        return @{
+            response = $result.response  # Direct response like working example
+            latency_ms = $latency
+            endpoint = $Endpoint
+            model = $RequestPayload.model
+            success = $true
         }
     }
     catch {
         # Update failure metrics
         $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
-        
+
         if ($global:OllamaConfig.Performance.EnableDebug) {
             Write-Host "⚠️ Ollama request failed: $($_.Exception.Message)" -ForegroundColor Yellow
             if ($RequestPayload.model) {
@@ -810,21 +859,22 @@ function Build-AutocompletePrompt {
     param(
         [string]$InputLine,
         [hashtable]$Context = @{},
-        [string]$ModelName = "powershell-fast:latest"
+        [string]$ModelName = $global:AUTOCOMPLETE_MODEL
     )
-    
-    # Simple, focused prompt for immediate completion
-    $userPrompt = "Complete: $InputLine"
-    
-    # Streamlined API payload - modelfile handles system prompt, parameters, and JSON format
+
+    # Simple prompt like the working example
+    $prompt = "Complete the following PowerShell command: $InputLine"
+
+    # Match the working example structure - no JSON format, no streaming
     return @{
         model = $ModelName
-        messages = @(
-            @{ role = "user"; content = $userPrompt }
-        )
-        format = "json"
-        stream = $true
-        keep_alive = "30s"
+        prompt = $prompt
+        stream = $false
+        options = @{
+            num_predict = 80    # From model config
+            temperature = 0.1   # From model config
+            top_p = 0.8        # From model config
+        }
     }
 }
 
@@ -833,70 +883,37 @@ function Build-CoderPrompt {
     param(
         [string]$InputLine,
         [hashtable]$Context = @{},
-        [string]$ModelName = "powershell-context:latest"
+        [string]$ModelName = $global:CODER_MODEL
     )
-    
-    # Build rich contextual information for sophisticated analysis
-    $contextParts = @()
-    
-    # Add directory context
-    if ($Context.Environment.Directory) { 
-        $contextParts += "Directory: $($Context.Environment.Directory)" 
-    }
-    
-    # Add git context if available
-    if ($Context.Environment.IsGitRepo) { 
-        $contextParts += "Git: $($Context.Environment.GitBranch) ($($Context.Environment.GitChanges) changes)" 
-    }
-    
-    # Add file context
-    if ($Context.Environment.FilesInDirectory) { 
-        $fileTypes = $Context.Environment.FilesInDirectory | 
-                     ForEach-Object { "*." + ($_ -split '\.')[-1] } | 
-                     Select-Object -Unique -First 5
-        $contextParts += "Files: [$($fileTypes -join ', ')]"
-    }
-    
-    # Add elevation status
-    if ($Context.Environment.IsElevated) {
-        $contextParts += "PowerShell: Elevated"
-    }
-    
-    # Add recent command patterns
-    if ($global:RecentTargets) {
-        $recentCommands = $global:RecentTargets | 
-                         ForEach-Object { Split-Path $_ -Leaf } | 
-                         Select-Object -First 3
-        $contextParts += "Recent: [$($recentCommands -join ', ')]"
-    }
-    
-    # Add parsed command context if available
-    if ($Context.ParsedCommand) {
-        $contextParts += "Command: $($Context.ParsedCommand.Name) ($($Context.ParsedCommand.Type))"
-        if ($Context.ParsedCommand.Arguments) {
-            $contextParts += "Args: [$($Context.ParsedCommand.Arguments -join ', ')]"
-        }
-    }
-    
-    $userPrompt = @"
-Context: $($contextParts -join ' | ')
-Input: $InputLine
 
-Analyze the context and provide sophisticated PowerShell command suggestions with detailed explanations.
-"@
-    
-    # Streamlined payload - modelfile handles system prompt, parameters, and JSON format
+    # Build simple context description
+    $contextParts = @()
+
+    if ($Context.Environment.Directory) {
+        $contextParts += "in $($Context.Environment.Directory)"
+    }
+
+    if ($Context.Environment.IsGitRepo) {
+        $contextParts += "git branch: $($Context.Environment.GitBranch)"
+    }
+
+    # Simple prompt format like the working example
+    $prompt = if ($contextParts.Count -gt 0) {
+        "PowerShell command completion $($contextParts -join ', '): $InputLine"
+    } else {
+        "Complete the following PowerShell command: $InputLine"
+    }
+
+    # Match the working example structure - no JSON format, no streaming, no chat messages
     return @{
         model = $ModelName
-        messages = @(
-            @{ role = "user"; content = $userPrompt }
-        )
-        format = "json"
-        stream = $true
+        prompt = $prompt
+        stream = $false
         options = @{
-            num_ctx = 16384     # Override for large context when needed
+            num_predict = 150   # From model config
+            temperature = 0.4   # From model config
+            top_p = 0.85       # From model config
         }
-        keep_alive = "5m"
     }
 }
 
@@ -906,7 +923,7 @@ function Build-RankerPrompt {
         [string]$Query,
         [string]$Completion,
         [hashtable]$Context = @{},
-        [string]$ModelName = "qwen3-reranker:latest"
+        [string]$ModelName = $global:RANKER_MODEL
     )
     
     # Build context summary for evaluation
@@ -1057,10 +1074,64 @@ function Get-CommandPrediction {
         # Get cached or generate new predictions
         $result = Get-CachedPrediction -CacheKey $cacheKey -Generator {
             try {
-                Invoke-OllamaCompletion -Model $modelConfig.Name -Prompt $InputLine -Context $context -TimeoutMs $modelConfig.Timeout
+                # Build appropriate prompt based on model type
+                $requestPayload = $null
+                $endpoint = "/api/chat"
+
+                if ($modelConfig.Name -eq $global:AUTOCOMPLETE_MODEL) {
+                    # Fast autocomplete
+                    $requestPayload = Build-AutocompletePrompt -InputLine $InputLine -Context $context
+                }
+                elseif ($modelConfig.Name -eq $global:CODER_MODEL) {
+                    # Context-aware coder
+                    $requestPayload = Build-CoderPrompt -InputLine $InputLine -Context $context
+                }
+                else {
+                    # Default to autocomplete for unknown models
+                    $requestPayload = Build-AutocompletePrompt -InputLine $InputLine -Context $context
+                }
+
+                # Call API with properly constructed payload
+                $apiResult = Invoke-OllamaCompletion -RequestPayload $requestPayload -Endpoint "/api/generate" -TimeoutMs $modelConfig.Timeout
+
+                # Simple text response handling like the working example
+                if ($apiResult.success -and $apiResult.response) {
+                    # The response is just plain text now
+                    $completionText = $apiResult.response
+
+                    # Split the response into multiple suggestions if it contains newlines or pipes
+                    $completions = @()
+                    if ($completionText) {
+                        # Clean up the response and split into suggestions
+                        $suggestions = $completionText -split '[\r\n|;]' |
+                                      ForEach-Object { $_.Trim() } |
+                                      Where-Object { $_ -and $_ -ne $InputLine }
+
+                        if ($suggestions) {
+                            $completions = @($suggestions | Select-Object -First 3)
+                        } else {
+                            # If no split, just use the whole response as one suggestion
+                            $completions = @($completionText.Trim())
+                        }
+                    }
+
+                    if ($completions.Count -gt 0) {
+                        return @{
+                            completions = $completions
+                            model = $modelConfig.Name
+                            latency_ms = $apiResult.latency_ms
+                        }
+                    }
+                }
+
+                # If no valid response, fall back to history
+                throw "No valid response from API"
             }
             catch {
                 # Fallback to history-based suggestions
+                if ($global:OllamaConfig.Performance.EnableDebug) {
+                    Write-Host "API call failed, using history fallback: $_" -ForegroundColor Yellow
+                }
                 Get-HistoryBasedSuggestions -InputLine $InputLine
             }
         }
@@ -1316,32 +1387,31 @@ function Get-PredictionLog {
 function Register-PowerAugerCleanupEvents {
     [CmdletBinding()]
     param()
-    
+
     try {
         # PowerShell exit event (primary cleanup)
         Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
             try {
                 Save-PowerAugerState
-                Stop-OllamaTunnel -Silent
             }
             catch {
                 # Silent cleanup - errors during shutdown are not critical
             }
         } | Out-Null
-        
+
         # .NET AppDomain exit event (backup cleanup for unexpected exits)
         $cleanupAction = {
             try {
-                Stop-OllamaTunnel -Silent
+                Save-PowerAugerState
             }
             catch {
                 # Silent cleanup
             }
         }
-        
+
         # Register .NET ProcessExit event for more reliable cleanup
         [System.AppDomain]::CurrentDomain.add_ProcessExit($cleanupAction)
-        
+
         # Windows console control event (Ctrl+C, system shutdown, etc.)
         if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
             try {
@@ -1349,23 +1419,23 @@ function Register-PowerAugerCleanupEvents {
                 Add-Type -TypeDefinition @"
                     using System;
                     using System.Runtime.InteropServices;
-                    
+
                     public static class ConsoleHelper {
                         public delegate bool ConsoleCtrlDelegate(int dwCtrlType);
-                        
+
                         [DllImport("kernel32.dll")]
                         public static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
-                        
+
                         public const int CTRL_C_EVENT = 0;
                         public const int CTRL_BREAK_EVENT = 1;
                         public const int CTRL_CLOSE_EVENT = 2;
                         public const int CTRL_LOGOFF_EVENT = 5;
                         public const int CTRL_SHUTDOWN_EVENT = 6;
-                        
+
                         public static bool ConsoleCtrlHandler(int dwCtrlType) {
                             try {
                                 // Call PowerShell function for cleanup
-                                System.Management.Automation.PowerShell.Create().AddScript("Stop-OllamaTunnel -Silent").Invoke();
+                                System.Management.Automation.PowerShell.Create().AddScript("Save-PowerAugerState").Invoke();
                                 return true;
                             } catch {
                                 return false;
@@ -1373,19 +1443,19 @@ function Register-PowerAugerCleanupEvents {
                         }
                     }
 "@ -ErrorAction SilentlyContinue
-                
+
                 # Register the console control handler
                 $handler = [ConsoleHelper+ConsoleCtrlDelegate] {
                     param($ctrlType)
                     try {
-                        Stop-OllamaTunnel -Silent
+                        Save-PowerAugerState
                         return $true
                     }
                     catch {
                         return $false
                     }
                 }
-                
+
                 [ConsoleHelper]::SetConsoleCtrlHandler($handler, $true)
             }
             catch {
@@ -1395,13 +1465,12 @@ function Register-PowerAugerCleanupEvents {
                 }
             }
         }
-        
+
         # WMI system shutdown event (Windows-specific)
         try {
             Register-WmiEvent -Query "SELECT * FROM Win32_SystemShutdownEvent" -Action {
                 try {
                     Save-PowerAugerState
-                    Stop-OllamaTunnel -Silent
                 }
                 catch {
                     # Silent cleanup
@@ -1411,9 +1480,9 @@ function Register-PowerAugerCleanupEvents {
         catch {
             # WMI events might not be available in all environments
         }
-        
+
         if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "✅ Registered comprehensive cleanup events" -ForegroundColor Green
+            Write-Host "✅ Registered cleanup events for state persistence" -ForegroundColor Green
         }
     }
     catch {
@@ -1427,60 +1496,58 @@ function Initialize-OllamaPredictor {
     [CmdletBinding()]
     param(
         [switch]$EnableDebug,
-        [switch]$StartTunnel = $true,
         [switch]$NoPrewarm
     )
-    
+
     # Load configuration from file first, which may enable debug mode or change settings
     Load-PowerAugerConfiguration
 
     if ($EnableDebug) {
         $global:OllamaConfig.Performance.EnableDebug = $true
     }
-    
-    Write-Host "🚀 Initializing Ollama PowerShell Predictor..." -ForegroundColor Cyan
-    
-    Load-PowerAugerState
-    
-    # Start SSH tunnel
-    if ($StartTunnel) {
-        $connected = Start-OllamaTunnel
-        if (-not $connected) {
-            Write-Host "⚠️ Could not establish SSH tunnel. Predictor will use fallback mode." -ForegroundColor Yellow
-        }
-        elseif (-not $NoPrewarm) {
-            # Pre-warm models to reduce first-use latency
-            Write-Host "🔥 Pre-warming models in the background... (this may take a moment)" -ForegroundColor Yellow
-            
-            foreach ($modelEntry in $global:ModelRegistry.GetEnumerator()) {
-                $modelName = $modelEntry.Value.Name
-                $keepAlive = $modelEntry.Value.KeepAlive
-                
-                # Use a fire-and-forget job to load the model
-                Start-Job -ScriptBlock {
-                    param($modelToWarm, $keepAliveSetting, $apiUrl, $debugEnabled)
-                    
-                    if ($debugEnabled) {
-                        Write-Host "  - Sending pre-warm request to '$modelToWarm'..."
-                    }
-                    
-                    $body = @{
-                        model      = $modelToWarm
-                        prompt     = "Pre-warming model" # Simple prompt, just to load it
-                        stream     = $false
-                        keep_alive = $keepAliveSetting
-                    } | ConvertTo-Json
 
-                    try {
-                        # Use a long timeout because model loading can be slow.
-                        # The job runs in the background, so it won't block the user.
-                        $null = Invoke-RestMethod -Uri "$apiUrl/api/generate" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 120 -ErrorAction Stop
-                    }
-                    catch {
-                        # This is a background job, so we can't easily show warnings. The failure is non-critical.
-                    }
-                } -ArgumentList $modelName, $keepAlive, $global:OllamaConfig.Server.ApiUrl, $global:OllamaConfig.Performance.EnableDebug | Out-Null
-            }
+    Write-Host "🚀 Initializing Ollama PowerShell Predictor..." -ForegroundColor Cyan
+
+    Load-PowerAugerState
+
+    # Test local Ollama connection
+    $connected = Test-OllamaConnection
+    if (-not $connected) {
+        Write-Host "⚠️ Could not connect to local Ollama. Predictor will use fallback mode." -ForegroundColor Yellow
+        Write-Host "   Ensure Ollama is running locally on $($global:OllamaConfig.Server.ApiUrl)" -ForegroundColor Yellow
+    }
+    elseif (-not $NoPrewarm) {
+        # Pre-warm models to reduce first-use latency
+        Write-Host "🔥 Pre-warming models in the background... (this may take a moment)" -ForegroundColor Yellow
+
+        foreach ($modelEntry in $global:ModelRegistry.GetEnumerator()) {
+            $modelName = $modelEntry.Value.Name
+            $keepAlive = $modelEntry.Value.KeepAlive
+
+            # Use a fire-and-forget job to load the model
+            Start-Job -ScriptBlock {
+                param($modelToWarm, $keepAliveSetting, $apiUrl, $debugEnabled)
+
+                if ($debugEnabled) {
+                    Write-Host "  - Sending pre-warm request to '$modelToWarm'..."
+                }
+
+                $body = @{
+                    model      = $modelToWarm
+                    prompt     = "Pre-warming model" # Simple prompt, just to load it
+                    stream     = $false
+                    keep_alive = $keepAliveSetting
+                } | ConvertTo-Json
+
+                try {
+                    # Use a long timeout because model loading can be slow.
+                    # The job runs in the background, so it won't block the user.
+                    $null = Invoke-RestMethod -Uri "$apiUrl/api/generate" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 120 -ErrorAction Stop
+                }
+                catch {
+                    # This is a background job, so we can't easily show warnings. The failure is non-critical.
+                }
+            } -ArgumentList $modelName, $keepAlive, $global:OllamaConfig.Server.ApiUrl, $global:OllamaConfig.Performance.EnableDebug | Out-Null
         }
     }
     
@@ -1588,6 +1655,7 @@ $global:SmartDefaults = @{
 $global:ModelRegistry = @{
     'FastCompletion' = $global:OllamaConfig.Models.FastCompletion
     'ContextAware'   = $global:OllamaConfig.Models.ContextAware
+    'Ranker'         = $global:OllamaConfig.Models.Ranker
     # Future models: Python, JavaScript, JSON-specific, etc.
 }
 
@@ -1613,7 +1681,8 @@ Export-ModuleMember -Function @(
     'Clear-PowerAugerCache' # NEW
 )
 
-# Auto-initialize if not in module development mode
-if (-not $env:OLLAMA_PREDICTOR_DEV_MODE) {
+# Auto-initialize if not in module development mode and not already initialized
+if (-not $env:OLLAMA_PREDICTOR_DEV_MODE -and -not $global:PowerAugerInitialized) {
     Initialize-OllamaPredictor
+    $global:PowerAugerInitialized = $true
 }
