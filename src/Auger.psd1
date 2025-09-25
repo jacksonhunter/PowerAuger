@@ -8,7 +8,20 @@
     Description = 'Ollama-powered PSReadLine predictor with history learning'
     PowerShellVersion = '7.2'
 
-    FunctionsToExport = @('Show-PowerAugerStatus')
+    FunctionsToExport = @(
+        'Show-PowerAugerStatus',
+        'Get-PowerAugerInternals',
+        'Test-PowerAugerCacheSharing',
+        'Save-PowerAugerCache',
+        'Import-PowerAugerCache',
+        'Add-PowerAugerHistory',
+        'Start-PowerAugerPrompt',
+        'Set-PowerAugerPrompt',
+        'Register-PowerAugerEvents',
+        'Unregister-PowerAugerEvents',
+        'Start-PowerAugerAutoRefresh',
+        'Stop-PowerAugerAutoRefresh'
+    )
 
     PrivateData = @{
         PSData = @{
