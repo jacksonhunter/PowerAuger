@@ -9,18 +9,9 @@
     PowerShellVersion = '7.2'
 
     FunctionsToExport = @(
-        'Show-PowerAugerStatus',
-        'Get-PowerAugerInternals',
-        'Test-PowerAugerCacheSharing',
-        'Save-PowerAugerCache',
-        'Import-PowerAugerCache',
-        'Add-PowerAugerHistory',
-        'Start-PowerAugerPrompt',
-        'Set-PowerAugerPrompt',
-        'Register-PowerAugerEvents',
-        'Unregister-PowerAugerEvents',
-        'Start-PowerAugerAutoRefresh',
-        'Stop-PowerAugerAutoRefresh'
+        'Show-PowerAugerStatus',     # Display predictor status and statistics
+        'Set-PowerAugerPrompt',       # Enable gradient cat prompt
+        'Stop-PowerAugerAutoRefresh'  # Allow users to disable auto-refresh if needed
     )
 
     PrivateData = @{

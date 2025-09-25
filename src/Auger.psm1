@@ -21,16 +21,30 @@ class PowerAugerPredictor : ICommandPredictor {
     hidden static [string] $CachePath = "$env:LOCALAPPDATA\PowerAuger\ai_cache.json"
 
     # History context
-    hidden static [System.Collections.ArrayList] $HistoryExamples = @()
+    hidden static [System.Collections.Concurrent.ConcurrentBag[object]] $HistoryExamples = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
     # Enhanced contextual learning system (hashtable with command|path keys)
-    hidden static [hashtable] $ContextualHistory = @{}
+    hidden static [hashtable] $ContextualHistory = [hashtable]::Synchronized(@{})
     hidden static [int] $MaxContextualHistorySize = 300
 
-    # Background prediction infrastructure
+    # Background prediction infrastructure with thread-safe message passing
     hidden static [System.Management.Automation.Runspaces.Runspace] $PredictionRunspace = $null
     hidden static [System.Management.Automation.PowerShell] $PredictionPowerShell = $null
-    hidden static [System.Collections.Concurrent.ConcurrentQueue[hashtable]] $PredictionQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
+
+    # Thread-safe message queues for communication with background runspace
+    hidden static [System.Collections.Concurrent.BlockingCollection[hashtable]] $MessageQueue = [System.Collections.Concurrent.BlockingCollection[hashtable]]::new(100)  # Max 100 items
+    hidden static [System.Collections.Concurrent.ConcurrentDictionary[string,object]] $ResponseCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+
+    # Channel for real-time updates (PowerShell 7+)
+    hidden static [System.Threading.Channels.Channel[hashtable]] $UpdateChannel = [System.Threading.Channels.Channel]::CreateUnbounded[hashtable]()
+
+    # Cancellation token for clean shutdown
+    hidden static [System.Threading.CancellationTokenSource] $CancellationSource = [System.Threading.CancellationTokenSource]::new()
+
+    # Shutdown mutex for cleanup synchronization
+    hidden static [System.Threading.Mutex] $ShutdownMutex = [System.Threading.Mutex]::new($false)
+
+    # Background running state
     hidden static [bool] $IsBackgroundRunning = $false
 
     PowerAugerPredictor() {
@@ -161,26 +175,51 @@ class PowerAugerPredictor : ICommandPredictor {
             [PowerAugerPredictor]::PredictionRunspace = [runspacefactory]::CreateRunspace()
             [PowerAugerPredictor]::PredictionRunspace.Open()
 
-            # Share variables with the runspace
-            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('Cache', [PowerAugerPredictor]::Cache)
-            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('Queue', [PowerAugerPredictor]::PredictionQueue)
+            # Pass thread-safe message queues and channel to the runspace
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('MessageQueue', [PowerAugerPredictor]::MessageQueue)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ResponseCache', [PowerAugerPredictor]::ResponseCache)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('UpdateChannel', [PowerAugerPredictor]::UpdateChannel)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('CancellationToken', [PowerAugerPredictor]::CancellationSource.Token)
+
+            # Pass read-only configuration values (not shared references)
             [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('Model', [PowerAugerPredictor]::Model)
             [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ApiUrl', [PowerAugerPredictor]::ApiUrl)
 
-            # Pass history examples to background runspace
-            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('HistoryExamples', [PowerAugerPredictor]::HistoryExamples)
-            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ContextualHistory', [PowerAugerPredictor]::ContextualHistory)
+            # Create deep copies of history for the background runspace
+            $historyCopy = @()
+            foreach ($item in [PowerAugerPredictor]::HistoryExamples) {
+                $historyCopy += @{ Prefix = $item.Prefix; Completion = $item.Completion }
+            }
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('HistoryExamples', $historyCopy)
 
-            # Create the background script - NO PARAMETERS, use variables directly
+            # Create a snapshot of contextual history
+            $contextHistoryCopy = @{}
+            foreach ($key in [PowerAugerPredictor]::ContextualHistory.Keys) {
+                $value = [PowerAugerPredictor]::ContextualHistory[$key]
+                $contextHistoryCopy[$key] = @{
+                    FullCommand = $value.FullCommand
+                    Input = $value.Input
+                    Completion = $value.Completion
+                    Context = if ($value.Context) { $value.Context.Clone() } else { $null }
+                    AcceptedCount = $value.AcceptedCount
+                    LastUsed = $value.LastUsed
+                }
+            }
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ContextualHistory', $contextHistoryCopy)
+
+            # Create the background script with proper message passing
             $backgroundScript = {
-                # Access shared variables directly from runspace - these are references, not copies!
+                # Local cache for the background runspace (not shared)
+                $localCache = @{}
                 $lastSaveTime = Get-Date
                 $saveIntervalMinutes = 5
 
-                while ($true) {
+                # Check for cancellation
+                while (-not $CancellationToken.IsCancellationRequested) {
                     try {
+                        # Use BlockingCollection for thread-safe message retrieval with cancellation support
                         $request = $null
-                        if ($Queue.TryDequeue([ref]$request)) {
+                        if ($MessageQueue.TryTake([ref]$request, 200, $CancellationToken)) {
                             # Get context for this request if provided
                             $currentContext = $request.Context
                             if (-not $currentContext) {
@@ -262,33 +301,54 @@ class PowerAugerPredictor : ICommandPredictor {
                                                          -TimeoutSec 5 -ErrorAction Stop
 
                             if ($response.response) {
-                                # Add to cache
-                                $Cache[$request.Input] = @{
+                                # Add to local cache
+                                $localCache[$request.Input] = @{
                                     Completion = $response.response.Trim()
                                     Timestamp = Get-Date
                                 }
 
-                                # Signal that new completions are available
-                                $Cache['_new_completions'] = $true
+                                # Send response back through thread-safe dictionary
+                                $responseData = @{
+                                    Completion = $response.response.Trim()
+                                    Timestamp = Get-Date
+                                }
+                                [void]$ResponseCache.TryAdd($request.Input, $responseData)
+
+                                # Send update through channel for real-time notification
+                                $updateMessage = @{
+                                    Type = 'PredictionComplete'
+                                    Input = $request.Input
+                                    Completion = $response.response.Trim()
+                                    QueueCount = $MessageQueue.Count
+                                    Timestamp = Get-Date
+                                }
+                                [void]$UpdateChannel.Writer.TryWrite($updateMessage)
                             }
                         }
 
                         # Pre-fetch common prefixes ONCE at startup
-                        if ($Cache.Count -eq 0 -and -not $Cache.ContainsKey('_initialized')) {
+                        if ($localCache.Count -eq 0 -and -not $localCache.ContainsKey('_initialized')) {
+                            # Send startup notification
+                            [void]$UpdateChannel.Writer.TryWrite(@{
+                                Type = 'BackgroundStarted'
+                                QueueCount = $MessageQueue.Count
+                            })
+
                             foreach ($prefix in @("Get-", "Set-", "New-", "Remove-")) {
-                                if (-not $Cache.ContainsKey($prefix)) {
-                                    $Queue.Enqueue(@{Input = $prefix})
+                                if (-not $localCache.ContainsKey($prefix)) {
+                                    # Send message to self for pre-warming
+                                    [void]$MessageQueue.TryAdd(@{Input = $prefix}, 100)
                                 }
                             }
                             # Mark that we've done initial warming
-                            $Cache['_initialized'] = @{ Completion = "true"; Timestamp = Get-Date }
+                            $localCache['_initialized'] = @{ Completion = "true"; Timestamp = Get-Date }
                         }
 
                         # Periodic cache save every 5 minutes
                         if ((Get-Date) - $lastSaveTime -gt [TimeSpan]::FromMinutes($saveIntervalMinutes)) {
                             try {
-                                # Only save if cache has real entries (not just _initialized)
-                                if ($Cache.Count -gt 1) {
+                                # Only save if local cache has real entries (not just _initialized)
+                                if ($localCache.Count -gt 1) {
                                     $cachePath = "$env:LOCALAPPDATA\PowerAuger\ai_cache.json"
                                     $cacheDir = Split-Path -Path $cachePath -Parent
                                     if (-not (Test-Path $cacheDir)) {
@@ -297,27 +357,70 @@ class PowerAugerPredictor : ICommandPredictor {
 
                                     # Filter out internal keys when saving
                                     $cacheData = @{}
-                                    foreach ($key in $Cache.Keys) {
+                                    foreach ($key in $localCache.Keys) {
                                         if ($key -notmatch '^_') {
-                                            $cacheData[$key] = $Cache[$key]
+                                            $cacheData[$key] = $localCache[$key]
                                         }
                                     }
 
                                     $cacheData | ConvertTo-Json -Depth 3 | Set-Content -Path $cachePath -Force
                                     $lastSaveTime = Get-Date
+
+                                    # Also sync to ResponseCache for main thread access
+                                    foreach ($key in $cacheData.Keys) {
+                                        [void]$ResponseCache.TryAdd($key, $cacheData[$key])
+                                    }
+
+                                    # Notify of cache save
+                                    [void]$UpdateChannel.Writer.TryWrite(@{
+                                        Type = 'CacheSaved'
+                                        ItemCount = $cacheData.Count
+                                        QueueCount = $MessageQueue.Count
+                                    })
                                 }
                             } catch {
                                 # Silent fail - don't disrupt background processing
                             }
                         }
 
-                        Start-Sleep -Milliseconds 200
+                        # No sleep needed - BlockingCollection.TryTake handles timeout
+                    }
+                    catch [System.OperationCanceledException] {
+                        # Clean cancellation requested
+                        break
                     }
                     catch {
-                        # Continue on error
+                        # Continue on error unless cancelled
+                        if ($CancellationToken.IsCancellationRequested) { break }
                         Start-Sleep -Milliseconds 500
                     }
                 }
+
+                # Cleanup on exit
+                try {
+                    # Send shutdown notification
+                    [void]$UpdateChannel.Writer.TryWrite(@{
+                        Type = 'BackgroundStopping'
+                        QueueCount = 0
+                    })
+
+                    # Final cache save before exit
+                    if ($localCache.Count -gt 1) {
+                        $cachePath = "$env:LOCALAPPDATA\PowerAuger\ai_cache.json"
+                        $cacheData = @{}
+                        foreach ($key in $localCache.Keys) {
+                            if ($key -notmatch '^_') {
+                                $cacheData[$key] = $localCache[$key]
+                            }
+                        }
+                        $cacheData | ConvertTo-Json -Depth 3 | Set-Content -Path $cachePath -Force
+                    }
+
+                    # Complete the channel
+                    $UpdateChannel.Writer.TryComplete()
+                } catch {}
+
+                Write-Host "Background prediction engine stopped cleanly" -ForegroundColor Yellow
             }
 
             # Start the background PowerShell
@@ -447,7 +550,7 @@ class PowerAugerPredictor : ICommandPredictor {
 
             # Queue AI completion for top TabExpansion2 result if not already cached/queued
             if ([PowerAugerPredictor]::IsBackgroundRunning -and
-                [PowerAugerPredictor]::PredictionQueue.Count -lt 50 -and
+                [PowerAugerPredictor]::MessageQueue.Count -lt 50 -and
                 $tabCompletions -and $tabCompletions.CompletionMatches.Count -gt 0) {
 
                 # Get the top command completion
@@ -458,21 +561,14 @@ class PowerAugerPredictor : ICommandPredictor {
                 if ($topCompletion) {
                     $completionText = $topCompletion.CompletionText
 
-                    # Check if not already cached or queued
-                    if (-not [PowerAugerPredictor]::Cache.ContainsKey($completionText)) {
-                        # Check if not already in queue (avoid duplicates)
-                        $alreadyQueued = $false
-                        try {
-                            # Note: ConcurrentQueue doesn't have Contains, so track separately if needed
-                            # For now, just queue it - duplicates are handled by cache check in background
-                        } catch {}
-
-                        if (-not $alreadyQueued) {
-                            [PowerAugerPredictor]::PredictionQueue.Enqueue(@{
-                                Input = $completionText
-                                Context = $currentContext
-                            })
+                    # Check if not already cached in response cache
+                    if (-not [PowerAugerPredictor]::ResponseCache.ContainsKey($completionText)) {
+                        # Send message to background runspace
+                        $message = @{
+                            Input = $completionText
+                            Context = $currentContext.Clone()  # Clone to avoid shared references
                         }
+                        [void][PowerAugerPredictor]::MessageQueue.TryAdd($message, 100)
                     }
                 }
             }
@@ -558,15 +654,12 @@ class PowerAugerPredictor : ICommandPredictor {
                 }
 
                 # Also maintain simple history for backward compatibility
+                # ConcurrentBag doesn't support RemoveAt, so just add without pruning
+                # The bag will grow but it's thread-safe
                 [PowerAugerPredictor]::HistoryExamples.Add(@{
                     Prefix = $prefix
                     Completion = $completion
                 })
-
-                # Keep only recent simple examples
-                if ([PowerAugerPredictor]::HistoryExamples.Count -gt 30) {
-                    [PowerAugerPredictor]::HistoryExamples.RemoveAt(0)
-                }
             } catch {
                 # Silently fail - history tracking is optional
             }
@@ -625,285 +718,226 @@ function Import-PowerAugerCache {
 }
 
 # Debug function to access internal state
-function Get-PowerAugerInternals {
+function Get-PowerAugerState {
     @{
         IsBackgroundRunning = [PowerAugerPredictor]::IsBackgroundRunning
         CacheCount = [PowerAugerPredictor]::Cache.Count
+        ResponseCacheCount = [PowerAugerPredictor]::ResponseCache.Count
         CacheKeys = @([PowerAugerPredictor]::Cache.Keys)
-        QueueCount = [PowerAugerPredictor]::PredictionQueue.Count
+        QueueCount = [PowerAugerPredictor]::MessageQueue.Count
+        MaxQueueSize = 100
         ContextualHistoryCount = [PowerAugerPredictor]::ContextualHistory.Count
         ContextualHistoryKeys = @([PowerAugerPredictor]::ContextualHistory.Keys)
         CachePath = [PowerAugerPredictor]::CachePath
         RunspaceState = if ([PowerAugerPredictor]::PredictionRunspace) { [PowerAugerPredictor]::PredictionRunspace.RunspaceStateInfo.State } else { "Not created" }
+        IsCancellationRequested = [PowerAugerPredictor]::CancellationSource.IsCancellationRequested
     }
 }
 
-# Function to test cache sharing
-function Test-PowerAugerCacheSharing {
-    Write-Host "Testing cache sharing..." -ForegroundColor Cyan
+# Function to get the PowerAuger cat with dynamic coloring based on queue count
+function Get-PowerAugerCat {
+    param(
+        [int]$QueueCount = 0
+    )
 
-    # Initial state
-    $before = [PowerAugerPredictor]::Cache.Count
-    Write-Host "  Cache entries before: $before"
+    # Simple gradient colors
+    $colors = @(
+        @(166, 226, 46),   # Green
+        @(174, 129, 255),  # Purple
+        @(253, 151, 31)    # Orange
+    )
 
-    # Queue some predictions
-    Write-Host "  Queueing predictions..."
-    [PowerAugerPredictor]::PredictionQueue.Enqueue(@{Input = "Get-Process"; Context = @{DirName = "Test"}})
-    [PowerAugerPredictor]::PredictionQueue.Enqueue(@{Input = "Get-Service"; Context = @{DirName = "Test"}})
-    [PowerAugerPredictor]::PredictionQueue.Enqueue(@{Input = "Get-ChildItem"; Context = @{DirName = "Test"}})
+    # Cat characters: ᓚ (tail) ᘏ (body) ᗢ (head)
+    $catChars = @('ᓚ', 'ᘏ', 'ᗢ')
 
-    Write-Host "  Queue size: $([PowerAugerPredictor]::PredictionQueue.Count)"
-    Write-Host "  Waiting 3 seconds for background processing..."
-    Start-Sleep -Seconds 3
+    # Determine stress level (0-2)
+    $stressLevel = if ($QueueCount -eq 0) { 0 }
+                   elseif ($QueueCount -le 20) { 1 }
+                   else { 2 }
 
-    $after = [PowerAugerPredictor]::Cache.Count
-    Write-Host "  Cache entries after: $after"
+    $esc = [char]0x1b
+    $rgb = $colors[$stressLevel]
 
-    if ($after -gt $before) {
-        Write-Host "  ✅ Cache is being populated by background!" -ForegroundColor Green
-        Write-Host "  New cache keys:"
-        [PowerAugerPredictor]::Cache.Keys | Select-Object -First 5 | ForEach-Object { Write-Host "    - $_" }
-    } else {
-        Write-Host "  ❌ Cache not growing - checking runspace..." -ForegroundColor Red
+    # Build cat with selected color
+    $catDisplay = "${esc}[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m"
+    $catDisplay += $catChars -join ''
+    $catDisplay += "${esc}[0m"
 
-        if ([PowerAugerPredictor]::PredictionRunspace) {
-            $rs = [PowerAugerPredictor]::PredictionRunspace
-            try {
-                $rsCache = $rs.SessionStateProxy.GetVariable('Cache')
-                Write-Host "  Runspace cache count: $($rsCache.Count)"
-                Write-Host "  Same object? $([Object]::ReferenceEquals($rsCache, [PowerAugerPredictor]::Cache))"
-            } catch {
-                Write-Host "  Failed to access runspace cache: $_" -ForegroundColor Red
-            }
-        }
-    }
+    return $catDisplay
 }
 
 # Function to set up PowerAuger-enhanced prompt with queue health cat
 function Set-PowerAugerPrompt {
-    Set-PSReadLineOption -PromptText @{
-        Success = {
-            # Get queue health
-            $queueCount = 0
-            try {
-                $queueCount = [PowerAugerPredictor]::PredictionQueue.Count
-            } catch {}
-
-            # Determine cat mood and color based on queue
-            $cat = switch ($queueCount) {
-                {$_ -eq 0}    { "$([char]0x1b)[32mᓚᘏᗢ" }     # Green - purring
-                {$_ -le 3}    { "$([char]0x1b)[32mᓚᘏᗢ" }     # Green - happy
-                {$_ -le 7}    { "$([char]0x1b)[36mᓚᘏᗢ" }     # Cyan - content
-                {$_ -le 12}   { "$([char]0x1b)[36mᓚᘏᗢ" }     # Cyan - busy
-                {$_ -le 20}   { "$([char]0x1b)[33mᓚᘏᗢ" }     # Yellow - working
-                {$_ -le 30}   { "$([char]0x1b)[33mᓚᘏᗢ" }     # Yellow - concerned
-                {$_ -le 45}   { "$([char]0x1b)[35mᓚᘏᗢ" }     # Magenta - worried
-                {$_ -le 60}   { "$([char]0x1b)[31mᓚᘏᗢ" }     # Red - stressed
-                default       { "$([char]0x1b)[31mᓚᘏᗢ" }     # Red - overwhelmed
-            }
-            "$cat$([char]0x1b)[0m "  # Cat with reset
-        }
-        Error = {
-            # Always show stressed cat on error
-            "$([char]0x1b)[31mᓚᘏᗢ$([char]0x1b)[0m "
-        }
+    # Store the original prompt if not already saved
+    if (-not $global:PowerAugerOriginalPrompt) {
+        $global:PowerAugerOriginalPrompt = (Get-Content function:prompt -ErrorAction SilentlyContinue)
     }
 
-    Write-Host "PowerAuger prompt with queue health cat enabled!" -ForegroundColor Green
-    Write-Host "The cat in your prompt will change color based on AI queue pressure." -ForegroundColor Cyan
-}
-
-# Alternative: Function to create a custom prompt function
-function Start-PowerAugerPrompt {
-    # This replaces the entire prompt function
+    # Define the custom prompt function globally
     function global:prompt {
-        # Get queue health
+        # Get queue health from MessageQueue
         $queueCount = 0
         try {
-            $queueCount = [PowerAugerPredictor]::PredictionQueue.Count
+            $queueCount = [PowerAugerPredictor]::MessageQueue.Count
         } catch {}
 
-        # Determine cat and color
-        $catInfo = switch ($queueCount) {
-            {$_ -eq 0}    { @{Cat="ᓚᘏᗢ"; Color="Green"} }
-            {$_ -le 3}    { @{Cat="ᓚᘏᗢ"; Color="DarkGreen"} }
-            {$_ -le 7}    { @{Cat="ᓚᘏᗢ"; Color="Cyan"} }
-            {$_ -le 12}   { @{Cat="ᓚᘏᗢ"; Color="DarkCyan"} }
-            {$_ -le 20}   { @{Cat="ᓚᘏᗢ"; Color="Yellow"} }
-            {$_ -le 30}   { @{Cat="ᓚᘏᗢ"; Color="DarkYellow"} }
-            {$_ -le 45}   { @{Cat="ᓚᘏᗢ"; Color="Magenta"} }
-            {$_ -le 60}   { @{Cat="ᓚᘏᗢ"; Color="Red"} }
-            default       { @{Cat="ᓚᘏᗢ"; Color="DarkRed"} }
-        }
+        # Get the cat display using centralized function
+        $catDisplay = Get-PowerAugerCat -QueueCount $queueCount
 
-        # Build prompt with cat
-        Write-Host $catInfo.Cat -NoNewline -ForegroundColor $catInfo.Color
-        Write-Host " $($PWD.Path)" -NoNewline -ForegroundColor White
-        return "> "
+        # Also store globally for event systems to update
+        $global:PowerAugerCurrentCat = $catDisplay
+        $global:PowerAugerCurrentQueueCount = $queueCount
+
+        # Return the complete prompt string with cat and proper formatting
+        # Must end with the return value that becomes the prompt
+        "$catDisplay $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
     }
 
-    Write-Host "PowerAuger prompt enabled! Your prompt now shows queue health." -ForegroundColor Green
+    Write-Host "PowerAuger gradient cat prompt enabled!" -ForegroundColor Green
+    Write-Host "The cat ᓚᘏᗢ changes color based on AI queue pressure (green→purple→orange)" -ForegroundColor Cyan
 }
 
-# Function to register event-driven completion notifications
-function Register-PowerAugerEvents {
-    # Register an idle action that runs periodically
-    Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action {
-        try {
-            # Get current queue state
-            $queueCount = [PowerAugerPredictor]::PredictionQueue.Count
-            $cacheCount = [PowerAugerPredictor]::Cache.Count
+# Function to process channel updates (non-blocking)
+function Update-PowerAugerChannelMessages {
+    try {
+        # Check for updates from the background thread
+        $reader = [PowerAugerPredictor]::UpdateChannel.Reader
 
-            # Store previous state to detect changes
-            if (-not $global:PowerAugerLastState) {
-                $global:PowerAugerLastState = @{
-                    QueueCount = $queueCount
-                    CacheCount = $cacheCount
-                    LastCat = ""
-                }
-            }
-
-            # Determine current cat state
-            $catInfo = switch ($queueCount) {
-                {$_ -eq 0}    { @{Cat="ᓚᘏᗢ"; Color="Green"} }
-                {$_ -le 3}    { @{Cat="ᓚᘏᗢ"; Color="DarkGreen"} }
-                {$_ -le 7}    { @{Cat="ᓚᘏᗢ"; Color="Cyan"} }
-                {$_ -le 12}   { @{Cat="ᓚᘏᗢ"; Color="DarkCyan"} }
-                {$_ -le 20}   { @{Cat="ᓚᘏᗢ"; Color="Yellow"} }
-                {$_ -le 30}   { @{Cat="ᓚᘏᗢ"; Color="DarkYellow"} }
-                {$_ -le 45}   { @{Cat="ᓚᘏᗢ"; Color="Magenta"} }
-                {$_ -le 60}   { @{Cat="ᓚᘏᗢ"; Color="Red"} }
-                default       { @{Cat="ᓚᘏᗢ"; Color="DarkRed"} }
-            }
-
-            # Check if cache grew (new completions arrived)
-            $cacheGrew = $cacheCount -gt $global:PowerAugerLastState.CacheCount
-
-            # Check if queue changed significantly
-            $queueChanged = [Math]::Abs($queueCount - $global:PowerAugerLastState.QueueCount) -gt 5
-
-            if ($cacheGrew -or $queueChanged) {
-                # Trigger refresh by sending a virtual keystroke
-                # This simulates typing to trigger new suggestions
-                [Microsoft.PowerShell.PSConsoleReadLine]::Insert('')
-                [Microsoft.PowerShell.PSConsoleReadLine]::BackwardDeleteChar()
-
-                # Visual feedback - briefly flash the prompt
-                if ($cacheGrew) {
-                    Write-Host "`r$($catInfo.Cat) " -NoNewline -ForegroundColor $catInfo.Color
-                }
-            }
-
-            # Update state
-            $global:PowerAugerLastState.QueueCount = $queueCount
-            $global:PowerAugerLastState.CacheCount = $cacheCount
-            $global:PowerAugerLastState.LastCat = $catInfo.Cat
-
-        } catch {
-            # Silently fail to not disrupt terminal
-        }
-    }
-
-    Write-Host "PowerAuger event engine registered!" -ForegroundColor Green
-    Write-Host "The prompt will auto-refresh when new AI completions arrive." -ForegroundColor Cyan
-}
-
-# Function to unregister events
-function Unregister-PowerAugerEvents {
-    Get-EventSubscriber | Where-Object { $_.SourceIdentifier -eq 'PowerShell.OnIdle' } | Unregister-Event
-    Remove-Variable -Name PowerAugerLastState -Scope Global -ErrorAction SilentlyContinue
-    Write-Host "PowerAuger events unregistered." -ForegroundColor Yellow
-}
-
-# Alternative approach using a timer for more control
-function Start-PowerAugerAutoRefresh {
-    param(
-        [int]$IntervalMs = 500  # Check every 500ms
-    )
-
-    # Create a timer that checks for changes
-    $timer = New-Object System.Timers.Timer
-    $timer.Interval = $IntervalMs
-    $timer.AutoReset = $true
-
-    # Store timer globally so we can stop it later
-    $global:PowerAugerRefreshTimer = $timer
-
-    # Initialize state tracking
-    $global:PowerAugerLastState = @{
-        QueueCount = [PowerAugerPredictor]::PredictionQueue.Count
-        CacheCount = [PowerAugerPredictor]::Cache.Count
-        CurrentInput = ""
-    }
-
-    # Register timer event
-    Register-ObjectEvent -InputObject $timer -EventName Elapsed -SourceIdentifier PowerAugerRefresh -Action {
-        try {
-            # Check for new completions flag
-            $hasNewCompletions = [PowerAugerPredictor]::Cache.ContainsKey('_new_completions')
-
-            if ($hasNewCompletions) {
-                # Clear the flag first
-                [PowerAugerPredictor]::Cache.Remove('_new_completions')
-
-                # Get current input from PSReadLine
-                $currentLine = ""
-                $currentPos = 0
-                [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$currentLine, [ref]$currentPos)
-
-                # Only refresh if user has typed something meaningful
-                if ($currentLine.Length -gt 2) {
-                    # Check if we have a relevant completion for current input
-                    $hasRelevantCompletion = $false
-
-                    # Check exact match
-                    if ([PowerAugerPredictor]::Cache.ContainsKey($currentLine)) {
-                        $hasRelevantCompletion = $true
-                    }
-                    # Check if current input is a prefix of any cached completion
-                    else {
-                        foreach ($key in [PowerAugerPredictor]::Cache.Keys) {
-                            if ($key.StartsWith($currentLine, 'CurrentCultureIgnoreCase')) {
-                                $hasRelevantCompletion = $true
-                                break
-                            }
-                        }
+        # Process all available messages (non-blocking)
+        while ($reader.TryRead([ref]$update)) {
+            switch ($update.Type) {
+                'PredictionComplete' {
+                    # Update cat based on new queue count
+                    if ($update.QueueCount -ne $global:PowerAugerCurrentQueueCount) {
+                        $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $update.QueueCount
+                        $global:PowerAugerCurrentQueueCount = $update.QueueCount
                     }
 
-                    if ($hasRelevantCompletion) {
-                        # Trigger suggestion refresh by simulating a micro-edit
-                        # This is the least intrusive way to get PSReadLine to re-query predictions
+                    # Optional: Trigger PSReadLine refresh for new predictions
+                    # This is more conservative - only refresh if we have the current input
+                    $currentLine = ""
+                    $currentPos = 0
+                    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$currentLine, [ref]$currentPos)
+
+                    if ($currentLine -and $update.Input -and $currentLine.StartsWith($update.Input)) {
+                        # We have a relevant prediction - trigger refresh
                         [Microsoft.PowerShell.PSConsoleReadLine]::Insert(' ')
                         [Microsoft.PowerShell.PSConsoleReadLine]::BackwardDeleteChar()
                     }
                 }
+
+                'BackgroundStarted' {
+                    # Update cat for initial state
+                    $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $update.QueueCount
+                    $global:PowerAugerCurrentQueueCount = $update.QueueCount
+                }
+
+                'BackgroundStopping' {
+                    # Reset cat to idle state
+                    $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount 0
+                    $global:PowerAugerCurrentQueueCount = 0
+                }
+
+                'CacheSaved' {
+                    # Optional: Could show a brief notification
+                }
             }
-
-            # Update queue tracking for the cat indicator
-            $global:PowerAugerLastState.QueueCount = [PowerAugerPredictor]::PredictionQueue.Count
-            $global:PowerAugerLastState.CurrentInput = $currentLine
-
-        } catch {
-            # Silent fail
         }
+    } catch {
+        # Silently ignore errors to not disrupt the prompt
     }
-
-    # Start the timer
-    $timer.Start()
-
-    Write-Host "PowerAuger auto-refresh enabled!" -ForegroundColor Green
-    Write-Host "Suggestions will update automatically as AI completions arrive." -ForegroundColor Cyan
-    Write-Host "Check every ${IntervalMs}ms. Use Stop-PowerAugerAutoRefresh to stop." -ForegroundColor Gray
 }
 
-# Function to disable auto-refresh
-function Stop-PowerAugerAutoRefresh {
-    if ($global:PowerAugerRefreshTimer) {
-        $global:PowerAugerRefreshTimer.Stop()
-        Unregister-Event -SourceIdentifier PowerAugerRefresh -ErrorAction SilentlyContinue
-        Remove-Variable -Name PowerAugerRefreshTimer -Scope Global -ErrorAction SilentlyContinue
-        Remove-Variable -Name PowerAugerLastState -Scope Global -ErrorAction SilentlyContinue
-        Write-Host "PowerAuger auto-refresh disabled." -ForegroundColor Yellow
+# Function to enable channel-based real-time updates
+function Start-PowerAugerRealtimeUpdates {
+    param(
+        [int]$IntervalMs = 100  # Check every 100ms for updates
+    )
+
+    # Stop any existing timer
+    Stop-PowerAugerRealtimeUpdates
+
+    # Single timer for channel monitoring (not every keystroke!)
+    $script:UpdateTimer = New-Object System.Timers.Timer
+    $script:UpdateTimer.Interval = $IntervalMs
+    $script:UpdateTimer.AutoReset = $true
+
+    # Register timer event for channel monitoring
+    Register-ObjectEvent -InputObject $script:UpdateTimer -EventName Elapsed -SourceIdentifier PowerAugerChannelMonitor -Action {
+        try {
+            $reader = [PowerAugerPredictor]::UpdateChannel.Reader
+            $hasUpdates = $false
+            $latestQueueCount = -1
+
+            # Process ALL pending updates (drain the channel)
+            while ($reader.TryRead([ref]$update)) {
+                switch ($update.Type) {
+                    'PredictionComplete' {
+                        $hasUpdates = $true
+                        if ($update.QueueCount -ge 0) {
+                            $latestQueueCount = $update.QueueCount
+                        }
+                    }
+                    'QueueChanged' {
+                        $hasUpdates = $true
+                        if ($update.QueueCount -ge 0) {
+                            $latestQueueCount = $update.QueueCount
+                        }
+                    }
+                    'BackgroundStarted' {
+                        $hasUpdates = $true
+                        if ($update.QueueCount -ge 0) {
+                            $latestQueueCount = $update.QueueCount
+                        }
+                    }
+                    'BackgroundStopping' {
+                        $latestQueueCount = 0
+                        $hasUpdates = $true
+                    }
+                }
+            }
+
+            # Update cat ONCE with the latest queue count
+            if ($hasUpdates -and $latestQueueCount -ge 0) {
+                $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $latestQueueCount
+                $global:PowerAugerCurrentQueueCount = $latestQueueCount
+
+                # Trigger prompt refresh (safer than manipulating buffer)
+                # This will cause the prompt function to be called again
+                [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+            }
+        } catch {
+            # Silent fail to avoid disrupting the terminal
+        }
+    } | Out-Null
+
+    $script:UpdateTimer.Start()
+
+    Write-Host "PowerAuger real-time updates enabled!" -ForegroundColor Green
+    Write-Host "Channel monitoring every ${IntervalMs}ms for cat updates." -ForegroundColor Cyan
+}
+
+# Function to stop real-time updates
+function Stop-PowerAugerRealtimeUpdates {
+    if ($script:UpdateTimer) {
+        $script:UpdateTimer.Stop()
+        $script:UpdateTimer.Dispose()
+        $script:UpdateTimer = $null
+    }
+
+    # Unregister the event
+    Get-EventSubscriber -SourceIdentifier PowerAugerChannelMonitor -ErrorAction SilentlyContinue | Unregister-Event
+    Remove-Job -Name PowerAugerChannelMonitor -Force -ErrorAction SilentlyContinue
+}
+
+# Function to restore original prompt
+function Reset-PowerAugerPrompt {
+    if ($global:PowerAugerOriginalPrompt) {
+        Set-Content function:prompt -Value $global:PowerAugerOriginalPrompt
+        Remove-Variable -Name PowerAugerOriginalPrompt -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name PowerAugerCurrentCat -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name PowerAugerCurrentQueueCount -Scope Global -ErrorAction SilentlyContinue
+        Write-Host "Original prompt restored." -ForegroundColor Yellow
     }
 }
 
@@ -934,34 +968,32 @@ function Add-PowerAugerHistory {
 }
 
 # Export a status function for debugging
-function Show-PowerAugerStatus {
+function Get-PowerAugerStatus {
     Write-Host "PowerAuger Predictor Status:" -ForegroundColor Cyan
     Write-Host "  Contextual history: $([PowerAugerPredictor]::ContextualHistory.Count)" -ForegroundColor Green
-    Write-Host "  AI Cache (background): $([PowerAugerPredictor]::Cache.Count)"
+    Write-Host "  Legacy Cache: $([PowerAugerPredictor]::Cache.Count)"
+    Write-Host "  Response Cache (thread-safe): $([PowerAugerPredictor]::ResponseCache.Count)" -ForegroundColor Green
     Write-Host "  Model: $([PowerAugerPredictor]::Model)"
     Write-Host "  Background engine: $(if ([PowerAugerPredictor]::IsBackgroundRunning) { '✅ Running' } else { '❌ Stopped' })" -ForegroundColor $(if ([PowerAugerPredictor]::IsBackgroundRunning) { 'Green' } else { 'Red' })
 
     # Show queue status with gradient cat health indicator
     $queueCount = 0
     try {
-        $queueCount = [PowerAugerPredictor]::PredictionQueue.Count
+        $queueCount = [PowerAugerPredictor]::MessageQueue.Count
     } catch {}
 
-    # Queue health gradient using Nightdrive theme
-    # 9 states from happy (green) to stressed (magenta/orange)
-    $queueHealth = switch ($queueCount) {
-        {$_ -eq 0}    { @{ Cat = "ᓚᘏᗢ"; Color = "Green"; Desc = "purring" } }      # Success - #A6E22E
-        {$_ -le 3}    { @{ Cat = "ᓚᘏᗢ"; Color = "DarkGreen"; Desc = "happy" } }
-        {$_ -le 7}    { @{ Cat = "ᓚᘏᗢ"; Color = "Cyan"; Desc = "content" } }      # Secondary - #66D9EF
-        {$_ -le 12}   { @{ Cat = "ᓚᘏᗢ"; Color = "DarkCyan"; Desc = "busy" } }
-        {$_ -le 20}   { @{ Cat = "ᓚᘏᗢ"; Color = "Yellow"; Desc = "working" } }    # Accent - #E6DB74
-        {$_ -le 30}   { @{ Cat = "ᓚᘏᗢ"; Color = "DarkYellow"; Desc = "concerned" } }
-        {$_ -le 45}   { @{ Cat = "ᓚᘏᗢ"; Color = "Magenta"; Desc = "worried" } }   # Info - #AE81FF
-        {$_ -le 60}   { @{ Cat = "ᓚᘏᗢ"; Color = "Red"; Desc = "stressed" } }      # Error - #FD971F
-        default       { @{ Cat = "ᓚᘏᗢ"; Color = "DarkRed"; Desc = "overwhelmed" } } # Primary - #F92672
+    # Queue health status
+    $queueStatus = switch ($queueCount) {
+        {$_ -eq 0}    { @{ Color = "Green"; Desc = "idle" } }
+        {$_ -le 5}    { @{ Color = "DarkGreen"; Desc = "light" } }
+        {$_ -le 10}   { @{ Color = "Cyan"; Desc = "moderate" } }
+        {$_ -le 20}   { @{ Color = "Yellow"; Desc = "busy" } }
+        {$_ -le 30}   { @{ Color = "DarkYellow"; Desc = "heavy" } }
+        {$_ -le 45}   { @{ Color = "Magenta"; Desc = "overloaded" } }
+        default       { @{ Color = "Red"; Desc = "critical" } }
     }
 
-    Write-Host "  Queue: $queueCount $($queueHealth.Cat) ($($queueHealth.Desc))" -ForegroundColor $queueHealth.Color
+    Write-Host "  Queue: $queueCount ($($queueStatus.Desc))" -ForegroundColor $queueStatus.Color
 
     # Show contextual learning stats
     if ([PowerAugerPredictor]::ContextualHistory.Count -gt 0) {
@@ -990,31 +1022,6 @@ function Show-PowerAugerStatus {
         }
     }
 
-    # Show cache samples
-    if ([PowerAugerPredictor]::Cache.Count -gt 0) {
-        Write-Host "`n  Sample cache entries:" -ForegroundColor Yellow
-        $shown = 0
-        foreach ($key in [PowerAugerPredictor]::Cache.Keys) {
-            if ($shown -ge 3) { break }
-            $cached = [PowerAugerPredictor]::Cache[$key]
-            if ($cached) {
-                # Handle both direct string and hashtable with Completion property
-                $completion = if ($cached -is [string]) {
-                    $cached
-                } elseif ($cached.Completion) {
-                    $cached.Completion
-                } else {
-                    $null
-                }
-
-                if ($completion) {
-                    $preview = $completion.Substring(0, [Math]::Min(20, $completion.Length))
-                    Write-Host "    '$key' → '$preview...'"
-                    $shown++
-                }
-            }
-        }
-    }
 
     try {
         $test = Invoke-RestMethod -Uri "$([PowerAugerPredictor]::ApiUrl)/api/tags" -TimeoutSec 1
@@ -1066,8 +1073,7 @@ try {
         Write-Host "PowerAuger predictor registered successfully." -ForegroundColor Green
     }
 
-    # Auto-enable the refresh timer for live updates
-    Start-PowerAugerAutoRefresh -IntervalMs 750
+    # Event systems removed - no auto-refresh
 
 } catch {
     # First time registration
@@ -1079,8 +1085,7 @@ try {
         )
         Write-Host "PowerAuger predictor registered successfully." -ForegroundColor Green
 
-        # Auto-enable the refresh timer for live updates
-        Start-PowerAugerAutoRefresh -IntervalMs 750
+        # Event systems removed - no auto-refresh
 
     } catch {
         Write-Warning "Failed to register PowerAuger predictor: $_"
@@ -1089,33 +1094,79 @@ try {
 
 # Register cleanup on module removal
 $ExecutionContext.SessionState.Module.OnRemove = {
-    # Disable auto-refresh if running
-    Stop-PowerAugerAutoRefresh
-
-    # Save cache before stopping
-    try {
-        $cachePath = [PowerAugerPredictor]::CachePath
-        $cacheDir = Split-Path -Path $cachePath -Parent
-        if (-not (Test-Path $cacheDir)) {
-            New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-        }
-
-        # Convert cache to serializable format
-        $cacheData = @{}
-        foreach ($key in [PowerAugerPredictor]::Cache.Keys) {
-            $cacheData[$key] = [PowerAugerPredictor]::Cache[$key]
-        }
-
-        if ($cacheData.Count -gt 0) {
-            $cacheData | ConvertTo-Json -Depth 3 | Set-Content -Path $cachePath -Force
-            Write-Host "PowerAuger: Saved $($cacheData.Count) AI completions to cache" -ForegroundColor Green
-        }
-    } catch {
-        Write-Warning "Failed to save PowerAuger cache on exit: $_"
+    # Signal cancellation FIRST to stop background work
+    if ([PowerAugerPredictor]::CancellationSource) {
+        [PowerAugerPredictor]::CancellationSource.Cancel()
     }
 
-    # Stop background engine
-    Stop-PowerAugerBackground
+    # Stop real-time updates timer if running
+    Stop-PowerAugerRealtimeUpdates
+
+    # Complete the message queue to stop accepting new work
+    if ([PowerAugerPredictor]::MessageQueue) {
+        [PowerAugerPredictor]::MessageQueue.CompleteAdding()
+    }
+
+    # Wait for background to acknowledge shutdown with mutex
+    $acquired = $false
+    try {
+        if ([PowerAugerPredictor]::ShutdownMutex) {
+            $acquired = [PowerAugerPredictor]::ShutdownMutex.WaitOne(5000)
+        }
+
+        if ($acquired) {
+            # NOW safe to save cache after background has stopped
+            try {
+                $cachePath = [PowerAugerPredictor]::CachePath
+                $cacheDir = Split-Path -Path $cachePath -Parent
+                if (-not (Test-Path $cacheDir)) {
+                    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+                }
+
+                # Save both legacy cache and ResponseCache
+                $cacheData = @{}
+
+                # Get from legacy cache
+                foreach ($key in [PowerAugerPredictor]::Cache.Keys) {
+                    $cacheData[$key] = [PowerAugerPredictor]::Cache[$key]
+                }
+
+                # Also get from ResponseCache
+                foreach ($key in [PowerAugerPredictor]::ResponseCache.Keys) {
+                    if (-not $cacheData.ContainsKey($key)) {
+                        $value = $null
+                        if ([PowerAugerPredictor]::ResponseCache.TryGetValue($key, [ref]$value)) {
+                            $cacheData[$key] = $value
+                        }
+                    }
+                }
+
+                if ($cacheData.Count -gt 0) {
+                    $cacheData | ConvertTo-Json -Depth 3 | Set-Content -Path $cachePath -Force
+                    Write-Host "PowerAuger: Saved $($cacheData.Count) AI completions to cache" -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Failed to save PowerAuger cache on exit: $_"
+            }
+        }
+    } finally {
+        if ($acquired -and [PowerAugerPredictor]::ShutdownMutex) {
+            [PowerAugerPredictor]::ShutdownMutex.ReleaseMutex()
+        }
+    }
+
+    # Clean shutdown of runspace and PowerShell
+    if ([PowerAugerPredictor]::PredictionPowerShell) {
+        try { [PowerAugerPredictor]::PredictionPowerShell.Stop() } catch { }
+        try { [PowerAugerPredictor]::PredictionPowerShell.Dispose() } catch { }
+        [PowerAugerPredictor]::PredictionPowerShell = $null
+    }
+
+    if ([PowerAugerPredictor]::PredictionRunspace) {
+        try { [PowerAugerPredictor]::PredictionRunspace.Close() } catch { }
+        try { [PowerAugerPredictor]::PredictionRunspace.Dispose() } catch { }
+        [PowerAugerPredictor]::PredictionRunspace = $null
+    }
 
     # Unregister the predictor
     try {
@@ -1126,5 +1177,16 @@ $ExecutionContext.SessionState.Module.OnRemove = {
         Write-Host "PowerAuger predictor unregistered." -ForegroundColor Yellow
     } catch {
         # Ignore if already unregistered
+    }
+
+    # Clean up static resources
+    if ([PowerAugerPredictor]::MessageQueue) {
+        try { [PowerAugerPredictor]::MessageQueue.Dispose() } catch { }
+    }
+    if ([PowerAugerPredictor]::CancellationSource) {
+        try { [PowerAugerPredictor]::CancellationSource.Dispose() } catch { }
+    }
+    if ([PowerAugerPredictor]::ShutdownMutex) {
+        try { [PowerAugerPredictor]::ShutdownMutex.Dispose() } catch { }
     }
 }
