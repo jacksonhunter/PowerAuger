@@ -775,22 +775,23 @@ function Set-PowerAugerPrompt {
 
     # Define the custom prompt function globally
     function global:prompt {
-        # Get queue health from MessageQueue
+        # Check for channel updates first (event-driven, no timers)
+        Update-PowerAugerFromChannel
+
+        # Get current queue count
         $queueCount = 0
         try {
             $queueCount = [PowerAugerPredictor]::MessageQueue.Count
         } catch {}
 
-        # Get the cat display using centralized function
-        $catDisplay = Get-PowerAugerCat -QueueCount $queueCount
-
-        # Also store globally for event systems to update
-        $global:PowerAugerCurrentCat = $catDisplay
-        $global:PowerAugerCurrentQueueCount = $queueCount
+        # Use the cat from channel updates if available, otherwise calculate
+        if ($null -eq $global:PowerAugerCurrentCat -or $queueCount -ne $global:PowerAugerCurrentQueueCount) {
+            $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $queueCount
+            $global:PowerAugerCurrentQueueCount = $queueCount
+        }
 
         # Return the complete prompt string with cat and proper formatting
-        # Must end with the return value that becomes the prompt
-        "$catDisplay $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+        "$global:PowerAugerCurrentCat $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
     }
 
     Write-Host "PowerAuger gradient cat prompt enabled!" -ForegroundColor Green
@@ -848,86 +849,28 @@ function Update-PowerAugerChannelMessages {
     }
 }
 
-# Function to enable channel-based real-time updates
-function Start-PowerAugerRealtimeUpdates {
-    param(
-        [int]$IntervalMs = 100  # Check every 100ms for updates
-    )
+# Function to process channel updates when prompt is displayed
+# This is called from the prompt function itself - no timers needed
+function Update-PowerAugerFromChannel {
+    try {
+        $reader = [PowerAugerPredictor]::UpdateChannel.Reader
+        $latestQueueCount = -1
 
-    # Stop any existing timer
-    Stop-PowerAugerRealtimeUpdates
-
-    # Single timer for channel monitoring (not every keystroke!)
-    $script:UpdateTimer = New-Object System.Timers.Timer
-    $script:UpdateTimer.Interval = $IntervalMs
-    $script:UpdateTimer.AutoReset = $true
-
-    # Register timer event for channel monitoring
-    Register-ObjectEvent -InputObject $script:UpdateTimer -EventName Elapsed -SourceIdentifier PowerAugerChannelMonitor -Action {
-        try {
-            $reader = [PowerAugerPredictor]::UpdateChannel.Reader
-            $hasUpdates = $false
-            $latestQueueCount = -1
-
-            # Process ALL pending updates (drain the channel)
-            while ($reader.TryRead([ref]$update)) {
-                switch ($update.Type) {
-                    'PredictionComplete' {
-                        $hasUpdates = $true
-                        if ($update.QueueCount -ge 0) {
-                            $latestQueueCount = $update.QueueCount
-                        }
-                    }
-                    'QueueChanged' {
-                        $hasUpdates = $true
-                        if ($update.QueueCount -ge 0) {
-                            $latestQueueCount = $update.QueueCount
-                        }
-                    }
-                    'BackgroundStarted' {
-                        $hasUpdates = $true
-                        if ($update.QueueCount -ge 0) {
-                            $latestQueueCount = $update.QueueCount
-                        }
-                    }
-                    'BackgroundStopping' {
-                        $latestQueueCount = 0
-                        $hasUpdates = $true
-                    }
-                }
+        # Process all pending updates from channel
+        while ($reader.TryRead([ref]$update)) {
+            if ($update.QueueCount -ge 0) {
+                $latestQueueCount = $update.QueueCount
             }
-
-            # Update cat ONCE with the latest queue count
-            if ($hasUpdates -and $latestQueueCount -ge 0) {
-                $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $latestQueueCount
-                $global:PowerAugerCurrentQueueCount = $latestQueueCount
-
-                # Trigger prompt refresh (safer than manipulating buffer)
-                # This will cause the prompt function to be called again
-                [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
-            }
-        } catch {
-            # Silent fail to avoid disrupting the terminal
         }
-    } | Out-Null
 
-    $script:UpdateTimer.Start()
-
-    Write-Host "PowerAuger real-time updates enabled!" -ForegroundColor Green
-    Write-Host "Channel monitoring every ${IntervalMs}ms for cat updates." -ForegroundColor Cyan
-}
-
-# Function to stop real-time updates
-function Stop-PowerAugerRealtimeUpdates {
-    if ($script:UpdateTimer) {
-        $script:UpdateTimer.Stop()
-        $script:UpdateTimer.Dispose()
-        $script:UpdateTimer = $null
+        # Update cat if we got a new queue count
+        if ($latestQueueCount -ge 0 -and $latestQueueCount -ne $global:PowerAugerCurrentQueueCount) {
+            $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $latestQueueCount
+            $global:PowerAugerCurrentQueueCount = $latestQueueCount
+        }
+    } catch {
+        # Silent fail
     }
-
-    # Unregister the event
-    Get-EventSubscriber -SourceIdentifier PowerAugerChannelMonitor -ErrorAction SilentlyContinue | Unregister-Event
-    Remove-Job -Name PowerAugerChannelMonitor -Force -ErrorAction SilentlyContinue
 }
 
 # Function to restore original prompt
@@ -1022,7 +965,8 @@ function Get-PowerAugerStatus {
         }
     }
 
-
+    # DON'T show cache samples - they're not real predictions
+    # Just check Ollama connection
     try {
         $test = Invoke-RestMethod -Uri "$([PowerAugerPredictor]::ApiUrl)/api/tags" -TimeoutSec 1
         Write-Host "`n  Ollama: ✅ Connected" -ForegroundColor Green
@@ -1099,8 +1043,7 @@ $ExecutionContext.SessionState.Module.OnRemove = {
         [PowerAugerPredictor]::CancellationSource.Cancel()
     }
 
-    # Stop real-time updates timer if running
-    Stop-PowerAugerRealtimeUpdates
+    # No timers to stop - using event-driven channel updates
 
     # Complete the message queue to stop accepting new work
     if ([PowerAugerPredictor]::MessageQueue) {

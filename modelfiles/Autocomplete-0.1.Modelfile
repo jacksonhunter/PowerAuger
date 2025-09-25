@@ -1,52 +1,37 @@
-# Base model from the official Ollama library, a reliable substitute.
+# Ollama Modelfile for Fast Fill-in-the-Middle Autocomplete
+# Model: Jadio/Qwen3_4b_instruct_q4km:latest (2.5GB)
+# Purpose: Real-time code completion with <200ms latency
+
 FROM Jadio/Qwen3_4b_instruct_q4km:latest
 
-# Set temperature to near-zero for deterministic, fast, and predictable completions.
-PARAMETER temperature 0.1
+# Fill-in-the-Middle Template
+# Qwen3 uses specific FIM tokens for code completion
+# Format: <|fim_prefix|>code_before_cursor<|fim_suffix|>code_after_cursor<|fim_middle|>
+TEMPLATE """<|fim_prefix|>{{ .Prompt }}<|fim_suffix|>{{ .Suffix }}<|fim_middle|>"""
 
-# A smaller context window (4k) is a key optimization for speed and reduced memory
-# footprint, and is sufficient for most line-by-line autocomplete tasks.
-PARAMETER num_ctx 4096
+# Minimal system message for maximum speed
+SYSTEM """Complete the code."""
 
-# A very low top_k value is critical for autocomplete. It restricts the model to the most
-# probable tokens, increasing speed and preventing irrelevant or overly creative suggestions.
+# === CRITICAL AUTOCOMPLETE PARAMETERS ===
+
+# Sampling parameters - optimized for deterministic, fast completions
+PARAMETER temperature 0.15
+PARAMETER top_p 0.95
 PARAMETER top_k 10
-PARAMETER top_p 0.9
-PARAMETER repeat_penalty 1.1
+PARAMETER repeat_penalty 1.0
+PARAMETER repeat_last_n 64
 
-# Comprehensive stop tokens for clean JSON completion
-PARAMETER stop "<|im_start|>"
-PARAMETER stop "<|im_end|>"
+# Generation limits - tuned for IDE autocomplete
+PARAMETER num_predict 128
+PARAMETER num_ctx 2048
+
+# Stop sequences for FIM
+PARAMETER stop "<|fim_prefix|>"
+PARAMETER stop "<|fim_suffix|>"
+PARAMETER stop "<|fim_middle|>"
 PARAMETER stop "<|endoftext|>"
-PARAMETER stop "}"
-PARAMETER stop "}]"
+PARAMETER stop "\n\n"
 PARAMETER stop "```"
-PARAMETER stop "END"
 
-# Standard Qwen instruct template.
-TEMPLATE """<|im_start|>system
-{{.System }}<|im_end|>
-<|im_start|>user
-{{.Prompt }}<|im_end|>
-<|im_start|>assistant
-"""
-
-# JSON-first system prompt optimized for PowerShell autocomplete with strict schema
-SYSTEM """You are a PowerShell autocomplete engine. Provide immediate command completions for the given input.
-Focus on exact cmdlet matches, parameter completions, and common patterns. Be fast and precise.
-
-ALWAYS respond with valid JSON using this exact schema:
-{
-  "completions": [
-    {
-      "text": "command or completion text",
-      "confidence": 0.95,
-      "type": "cmdlet|parameter|path|variable|alias",
-      "partial_match": true
-    }
-  ]
-}
-
-Types: cmdlet, parameter, path, variable, alias
-Confidence: 0.0-1.0 (higher = more certain)
-Never include explanations, markdown, or text outside the JSON structure."""
+# Fixed seed for reproducibility
+PARAMETER seed 42
