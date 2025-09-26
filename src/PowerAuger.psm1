@@ -1,1688 +1,1328 @@
-# PowerAuger.psm1 - FIXED VERSION
-# ========================================================================================================
-# PRODUCTION-READY OLLAMA POWERSHELL PREDICTOR - FIXED RETURN VALUES
-# JSON-first, Continue-compatible, cross-platform intelligent command prediction
-# ========================================================================================================
+# PowerAuger.psm1 - Proper predictor plugin with Ollama
 
-#Requires -Version 7.0
+using namespace System.Management.Automation.Subsystem
+using namespace System.Management.Automation.Subsystem.Prediction
 
-# --------------------------------------------------------------------------------------------------------
-# GLOBAL CONFIGURATION AND STATE
-# --------------------------------------------------------------------------------------------------------
-
-# Global Model Name Constants - Easy to update when model names change
-$global:AUTOCOMPLETE_MODEL = "qwen2.5-0.5B-autocomplete-custom"  # Fast autocomplete model from working example
-$global:CODER_MODEL = "llama3.2:3b"                             # Fallback to a common model that likely exists
-$global:RANKER_MODEL = "llama3.2:1b"                            # Small model for ranking if needed 
-
-$global:OllamaConfig = @{
-    # Server Configuration
-    Server      = @{
-        LinuxHost     = $env:POWERAUGER_LINUX_HOST -or "192.168.50.194" # Default can be overridden by env var
-        LinuxPort     = 11434
-        LocalPort     = 11434
-        SSHUser       = $env:POWERAUGER_SSH_USER -or $null
-        SSHKey        = $env:POWERAUGER_SSH_KEY -or $null
-        TunnelProcess = $null
-        IsConnected   = $false
-        ApiUrl        = "http://localhost:11434"
-    }
-
-    # Model Strategy - Matching your actual model parameters
-    Models      = @{
-        FastCompletion = @{
-            Name        = $global:AUTOCOMPLETE_MODEL
-            UseCase     = "Quick completions <10 chars"
-            KeepAlive   = "30s"
-            MaxTokens   = 80
-            Temperature = 0.1    # Matches your Modelfile
-            TopP        = 0.8    # Matches your Modelfile
-            Timeout     = 30000  # 30 seconds - your models need time
-        }
-        ContextAware   = @{
-            Name        = $global:CODER_MODEL
-            UseCase     = "Complex completions with environment"
-            KeepAlive   = "5m"
-            MaxTokens   = 150
-            Temperature = 0.4    # Matches your Modelfile
-            TopP        = 0.85   # Matches your Modelfile
-            Timeout     = 30000  # 30 seconds - your models need time
-        }
-        Ranker = @{
-            Name        = $global:RANKER_MODEL
-            UseCase     = "Evaluation and scoring of completions"
-            KeepAlive   = "1m"
-            MaxTokens   = 50
-            Temperature = 0.0    # Deterministic for ranking
-            TopP        = 1.0    # No sampling for evaluation
-            Timeout     = 15000  # 15 seconds - faster evaluation
-        }
-    }
-    
-    # Performance Settings
-    Performance = @{
-        CacheTimeout            = 300
-        CacheSize               = 200
-        MaxHistoryLines         = 1000
-        RecentTargetsCount      = 30
-        SessionCleanupMinutes   = 30
-        EnableDebug             = $false
-        EnablePredictionLogging = $false # Default to off, can be enabled in config.json
-    }
-}
-
-# Global state containers
-$global:PredictionCache = @{}
-$global:ChatSessions = @{}
-$global:PredictionLog = [System.Collections.Generic.List[object]]::new()
-$global:RecentTargets = @()
-$global:CommandHistory = @()
-$global:PerformanceMetrics = @{
-    RequestCount       = 0
-    CacheHits          = 0
-    AverageLatency     = 0      # API latency
-    SuccessRate        = 1.0
-    ProviderTimings    = @{}    # Per-provider average latency
-    TotalContextTime   = 0      # Total context gathering average latency
-    AcceptanceTracking = @{} # Stores @{ Accepted = 0; Offered = 0 } per model/source
-}
-
-# --------------------------------------------------------------------------------------------------------
-# DATA PERSISTENCE & CONFIGURATION
-# --------------------------------------------------------------------------------------------------------
-$global:PowerAugerDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".PowerAuger"
-$global:PowerAugerConfigFile = Join-Path $global:PowerAugerDataPath "config.json"
-$global:PowerAugerHistoryFile = Join-Path $global:PowerAugerDataPath "history.json"
-$global:PowerAugerCacheFile = Join-Path $global:PowerAugerDataPath "cache.json"
-$global:PowerAugerTargetsFile = Join-Path $global:PowerAugerDataPath "recent_targets.json"
-$global:PowerAugerLogFile = Join-Path $global:PowerAugerDataPath "prediction_log.json"
-
-function Merge-Hashtables {
-    param($base, $overlay)
-    $result = $base.Clone()
-    foreach ($key in $overlay.Keys) {
-        if ($result.ContainsKey($key) -and $result[$key] -is [hashtable] -and $overlay[$key] -is [hashtable]) {
-            $result[$key] = Merge-Hashtables -base $result[$key] -overlay $overlay[$key]
-        }
-        else {
-            $result[$key] = $overlay[$key]
-        }
-    }
-    return $result
-}
-
-function Load-PowerAugerConfiguration {
-    if (Test-Path $global:PowerAugerConfigFile) {
-        try {
-            $fileContent = Get-Content -Path $global:PowerAugerConfigFile -Raw
-            if (-not [string]::IsNullOrWhiteSpace($fileContent)) {
-                $loadedConfig = $fileContent | ConvertFrom-Json -AsHashtable
-                $global:OllamaConfig = Merge-Hashtables -base $global:OllamaConfig -overlay $loadedConfig
-                # Always reset runtime state on module load - tunnel needs to be re-established
-                $global:OllamaConfig.Server.IsConnected = $false
-                $global:OllamaConfig.Server.TunnelProcess = $null
-                $global:OllamaConfig.Server.TunnelProcessId = $null
-            }
-        }
-        catch {
-            Write-Warning "Failed to load or parse configuration from $($global:PowerAugerConfigFile). Using defaults. Error: $($_.Exception.Message)"
-        }
-    }
-}
-
-function Load-PowerAugerState {
-    if ($global:OllamaConfig.Performance.EnableDebug) {
-        Write-Host "🔄 Loading PowerAuger state from $($global:PowerAugerDataPath)..." -ForegroundColor Cyan
-    }
-
-    if (Test-Path $global:PowerAugerHistoryFile) {
-        try { $global:CommandHistory = Get-Content -Path $global:PowerAugerHistoryFile -Raw | ConvertFrom-Json } catch {
-            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse history.json: $($_.Exception.Message)" }
-        }
-    }
-    if (Test-Path $global:PowerAugerCacheFile) {
-        try { $global:PredictionCache = Get-Content -Path $global:PowerAugerCacheFile -Raw | ConvertFrom-Json -AsHashtable } catch {
-            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse cache.json: $($_.Exception.Message)" }
-        }
-    }
-    if (Test-Path $global:PowerAugerTargetsFile) {
-        try { $global:RecentTargets = Get-Content -Path $global:PowerAugerTargetsFile -Raw | ConvertFrom-Json } catch {
-            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse recent_targets.json: $($_.Exception.Message)" }
-        }
-    }
-    if (Test-Path $global:PowerAugerLogFile) {
-        try {
-            $logData = Get-Content -Path $global:PowerAugerLogFile -Raw | ConvertFrom-Json
-            if ($logData) { $global:PredictionLog = [System.Collections.Generic.List[object]]::new($logData) }
-        }
-        catch {
-            if ($global:OllamaConfig.Performance.EnableDebug) { Write-Warning "Could not load or parse prediction_log.json: $($_.Exception.Message)" }
-        }
-    }
-}
-
-function Save-PowerAugerState {
-    [CmdletBinding()]
-    param()
-
-    if ($global:OllamaConfig.Performance.EnableDebug) {
-        Write-Host "💾 Saving PowerAuger state to $($global:PowerAugerDataPath)..." -ForegroundColor Cyan
-    }
-
-    if (-not (Test-Path $global:PowerAugerDataPath)) {
-        New-Item -Path $global:PowerAugerDataPath -ItemType Directory -Force | Out-Null
-    }
-
-    # Save Configuration
-    Save-PowerAugerConfiguration
-
-    # Save other state files
-    $global:CommandHistory | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerHistoryFile -Encoding UTF8 -ErrorAction SilentlyContinue
-    $global:PredictionCache | ConvertTo-Json -Depth 10 | Set-Content -Path $global:PowerAugerCacheFile -Encoding UTF8 -ErrorAction SilentlyContinue
-    $global:RecentTargets | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerTargetsFile -Encoding UTF8 -ErrorAction SilentlyContinue
-    $global:PredictionLog | ConvertTo-Json -Depth 5 | Set-Content -Path $global:PowerAugerLogFile -Encoding UTF8 -ErrorAction SilentlyContinue
-}
-
-function Save-PowerAugerConfiguration {
-    try {
-        if (-not (Test-Path $global:PowerAugerDataPath)) {
-            New-Item -Path $global:PowerAugerDataPath -ItemType Directory -Force | Out-Null
-        }
-        $configToSave = $global:OllamaConfig.Clone()
-        # Don't persist runtime state - these should be fresh on each module load
-        $configToSave.Server.Remove('TunnelProcess')
-        $configToSave.Server.Remove('IsConnected')  # Fix: Don't persist connection state
-        if ($configToSave.Server.ContainsKey('TunnelProcessId')) {
-            $configToSave.Server.Remove('TunnelProcessId')  # Also don't persist PID
-        }
-        $configToSave | ConvertTo-Json -Depth 10 | Set-Content -Path $global:PowerAugerConfigFile -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Warning "Failed to save configuration: $($_.Exception.Message)"
-    }
-}
-
-# --------------------------------------------------------------------------------------------------------
-# SSH TUNNEL MANAGEMENT
-# --------------------------------------------------------------------------------------------------------
-
-function Find-SSHTunnelProcess {
-    [CmdletBinding()]
+# Logging function - must be defined before the class
+function Write-PowerAugerLog {
     param(
-        [int]$LocalPort,
-        [string]$RemoteHost
-    )
-    
-    try {
-        # Method 1: Use .NET TcpConnectionInformation to find listening processes
-        $tcpConnections = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
-        $localEndpoint = $tcpConnections | Where-Object { $_.Port -eq $LocalPort -and $_.Address -eq [System.Net.IPAddress]::Loopback }
-        
-        if ($localEndpoint) {
-            # Method 2: Use netstat to find the PID more reliably
-            $netstatCmd = "netstat -ano"
-            $netstatOutput = & cmd /c $netstatCmd 2>$null
-            
-            foreach ($line in $netstatOutput) {
-                if ($line -match "TCP\s+127\.0\.0\.1:$LocalPort\s+.*\s+LISTENING\s+(\d+)") {
-                    $psid = $matches[1]
-                    
-                    # Verify this is actually an SSH process
-                    try {
-                        $process = Get-Process -Id $psid -ErrorAction SilentlyContinue
-                        if ($process -and ($process.ProcessName -eq "ssh" -or $process.ProcessName -eq "ssh.exe")) {
-                            if ($global:OllamaConfig.Performance.EnableDebug) {
-                                Write-Host "🔍 Found SSH tunnel process: PID $psid" -ForegroundColor Cyan
-                            }
-                            return [int]$psid
-                        }
-                    }
-                    catch {
-                        # Process might have exited, continue
-                    }
-                }
-            }
-        }
-        
-        # Method 3: Fallback - search all SSH processes and check their network connections
-        $sshProcesses = Get-Process -Name "ssh*" -ErrorAction SilentlyContinue
-        foreach ($proc in $sshProcesses) {
-            try {
-                # Use WMI to get network connections for this process (more reliable than CommandLine)
-                $connections = Get-WmiObject -Class Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
-                if ($connections) {
-                    # Check if this process has our port open
-                    $portCheck = netstat -ano | Select-String ":$LocalPort.*LISTENING.*$($proc.Id)"
-                    if ($portCheck) {
-                        if ($global:OllamaConfig.Performance.EnableDebug) {
-                            Write-Host "🔍 Found SSH tunnel via process search: PID $($proc.Id)" -ForegroundColor Cyan
-                        }
-                        return $proc.Id
-                    }
-                }
-            }
-            catch {
-                # Access denied or other error, continue
-            }
-        }
-        
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Warning "Could not find SSH tunnel process for port $LocalPort"
-        }
-        return $null
-    }
-    catch {
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Warning "Error finding SSH tunnel process: $($_.Exception.Message)"
-        }
-        return $null
-    }
-}
-
-function Start-OllamaTunnel {
-    [CmdletBinding()]
-    param([switch]$Force)
-
-    # First, check if there's already a working tunnel
-    if (-not $Force) {
-        $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
-        if ($tunnelPid) {
-            # Found a tunnel process - test if it's actually working
-            try {
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "🔍 Found existing SSH tunnel (PID: $tunnelPid), testing connection..." -ForegroundColor Yellow
-                }
-                $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
-                if ($testResponse) {
-                    # Tunnel is working! Update our state and return
-                    $global:OllamaConfig.Server.TunnelProcessId = $tunnelPid
-                    $global:OllamaConfig.Server.IsConnected = $true
-                    if ($global:OllamaConfig.Performance.EnableDebug) {
-                        Write-Host "✅ Using existing SSH tunnel (PID: $tunnelPid)" -ForegroundColor Green
-                    }
-                    return $true
-                }
-            }
-            catch {
-                # Tunnel exists but isn't working - we'll kill it and start fresh
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "⚠️ Existing tunnel not responding, restarting..." -ForegroundColor Yellow
-                }
-            }
-        }
-    }
-
-    # If we get here, either no tunnel exists or it's not working - clean up and start fresh
-    Stop-OllamaTunnel -Silent
-
-    try {
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "🔗 Starting SSH tunnel to $($global:OllamaConfig.Server.LinuxHost)" -ForegroundColor Cyan
-        }
-        
-        $sshArgs = @(
-            "-f", "-N", "-T", "-C"
-            "-o", "ExitOnForwardFailure=yes"
-            "-o", "ServerAliveInterval=30"
-            "-o", "ServerAliveCountMax=3"
-            "-L", "$($global:OllamaConfig.Server.LocalPort):localhost:$($global:OllamaConfig.Server.LinuxPort)"
-        )
-        
-        if (Test-Path $global:OllamaConfig.Server.SSHKey) {
-            $sshArgs += @("-i", $global:OllamaConfig.Server.SSHKey)
-        }
-        
-        $sshArgs += "$($global:OllamaConfig.Server.SSHUser)@$($global:OllamaConfig.Server.LinuxHost)"
-
-        # Start SSH with -f flag and track the resulting process
-        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $processInfo.FileName = "ssh"
-        $processInfo.Arguments = $sshArgs -join " "
-        $processInfo.UseShellExecute = $false
-        $processInfo.CreateNoWindow = $true
-        $processInfo.RedirectStandardError = $true
-        
-        $process = [System.Diagnostics.Process]::Start($processInfo)
-        # Wait maximum 10 seconds for SSH to fork (with -f it should be immediate)
-        if (-not $process.WaitForExit(10000)) {
-            # SSH didn't exit in 10 seconds, kill it and throw
-            $process.Kill()
-            throw "SSH tunnel process failed to fork within 10 seconds"
-        }
-
-        # Give the forked process time to establish the tunnel and retry finding it (with 10 second timeout)
-        $tunnelPid = $null
-        $timeout = [DateTime]::Now.AddSeconds(10)
-        $retries = 5
-        for ($i = 0; $i -lt $retries; $i++) {
-            if ([DateTime]::Now -gt $timeout) {
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "⏱️ Tunnel establishment timed out after 10 seconds" -ForegroundColor Red
-                }
-                throw "SSH tunnel establishment timed out after 10 seconds"
-            }
-            Start-Sleep -Seconds 2
-            $tunnelPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
-            if ($tunnelPid) {
-                break
-            }
-            if ($global:OllamaConfig.Performance.EnableDebug -and $i -eq 2) {
-                Write-Host "⏳ Waiting for tunnel to establish..." -ForegroundColor Yellow
-            }
-        }
-
-        # Test connection regardless of whether we found the PID
-        # (the tunnel might be working even if we can't find the process)
-        try {
-            $testResponse = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/version" -Method Get -TimeoutSec 5 -ErrorAction Stop
-        }
-        catch {
-            # Connection failed - tunnel didn't start properly
-            if ($global:OllamaConfig.Performance.EnableDebug) {
-                Write-Host "❌ Tunnel test failed: $($_.Exception.Message)" -ForegroundColor Red
-            }
-            throw
-        }
-
-        if ($testResponse) {
-            # Store the tunnel process info for later cleanup (might be null if we couldn't find it)
-            $global:OllamaConfig.Server.TunnelProcessId = $tunnelPid
-            $global:OllamaConfig.Server.TunnelProcess = $null # We don't have a direct handle
-            $global:OllamaConfig.Server.IsConnected = $true
-
-            if ($global:OllamaConfig.Performance.EnableDebug) {
-                if ($tunnelPid) {
-                    Write-Host "✅ SSH tunnel established in background (PID: $tunnelPid)" -ForegroundColor Green
-                } else {
-                    Write-Host "✅ SSH tunnel established (PID detection failed, but connection works)" -ForegroundColor Green
-                }
-            }
-            return $true
-        }
-    }
-    catch {
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "❌ SSH tunnel failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-        return $false
-    }
-}
-
-function Stop-OllamaTunnel {
-    [CmdletBinding()]
-    param([switch]$Silent)
-    
-    $tunnelStopped = $false
-    
-    # Method 1: Use stored PID if available
-    if ($global:OllamaConfig.Server.TunnelProcessId) {
-        try {
-            $process = Get-Process -Id $global:OllamaConfig.Server.TunnelProcessId -ErrorAction SilentlyContinue
-            if ($process) {
-                $process.Kill()
-                $tunnelStopped = $true
-                if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "🔗 Killed SSH tunnel process (PID: $($global:OllamaConfig.Server.TunnelProcessId))" -ForegroundColor Yellow
-                }
-            }
-        }
-        catch {
-            if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-                Write-Warning "Could not kill stored tunnel process: $($_.Exception.Message)"
-            }
-        }
-        $global:OllamaConfig.Server.TunnelProcessId = $null
-    }
-    
-    # Method 2: Fallback to finding the process (legacy support)
-    if (-not $tunnelStopped) {
-        $foundPid = Find-SSHTunnelProcess -LocalPort $global:OllamaConfig.Server.LocalPort -RemoteHost $global:OllamaConfig.Server.LinuxHost
-        if ($foundPid) {
-            try {
-                $process = Get-Process -Id $foundPid -ErrorAction SilentlyContinue
-                if ($process) {
-                    $process.Kill()
-                    $tunnelStopped = $true
-                    if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-                        Write-Host "🔗 Killed discovered SSH tunnel process (PID: $foundPid)" -ForegroundColor Yellow
-                    }
-                }
-            }
-            catch {
-                if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Warning "Could not kill discovered tunnel process: $($_.Exception.Message)"
-                }
-            }
-        }
-    }
-    
-    # Legacy cleanup
-    if ($global:OllamaConfig.Server.TunnelProcess -and -not $global:OllamaConfig.Server.TunnelProcess.HasExited) {
-        try {
-            $global:OllamaConfig.Server.TunnelProcess.Kill()
-            $tunnelStopped = $true
-        }
-        catch { }
-    }
-    
-    # Clean up stored references
-    $global:OllamaConfig.Server.TunnelProcess = $null
-    $global:OllamaConfig.Server.TunnelProcessId = $null
-    $global:OllamaConfig.Server.IsConnected = $false
-    
-    if (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug -and $tunnelStopped) {
-        Write-Host "✅ SSH tunnel stopped successfully" -ForegroundColor Green
-    }
-    elseif (-not $Silent -and $global:OllamaConfig.Performance.EnableDebug) {
-        Write-Host "⚠️ SSH tunnel stop attempted (no active tunnel found)" -ForegroundColor Yellow
-    }
-}
-
-function Test-OllamaConnection {
-    try {
-        $null = Invoke-RestMethod -Uri "$($global:OllamaConfig.Server.ApiUrl)/api/tags" -Method Get -TimeoutSec 2 -ErrorAction Stop
-        $global:OllamaConfig.Server.IsConnected = $true
-        return $true
-    }
-    catch {
-        $global:OllamaConfig.Server.IsConnected = $false
-        return $false
-    }
-}
-
-# --------------------------------------------------------------------------------------------------------
-# INTELLIGENT MODEL SELECTION
-# --------------------------------------------------------------------------------------------------------
-
-function Select-OptimalModel {
-    [CmdletBinding()]
-    param(
-        [string]$InputLine,
-        [hashtable]$Context = @{},
-        [int]$HistoryCount = 0
-    )
-    
-    # Fast model for simple completions
-    if ($InputLine.Length -lt 10 -and -not ($Context.HasComplexContext -or $Context.HasTargets)) {
-        return $global:OllamaConfig.Models.FastCompletion
-    }
-    
-    # Context-aware for everything else
-    return $global:OllamaConfig.Models.ContextAware
-}
-
-# --------------------------------------------------------------------------------------------------------
-# ADVANCED CONTEXT ENGINE
-# --------------------------------------------------------------------------------------------------------
-
-function _Get-EnvironmentContext {
-    param([hashtable]$Context)
-
-    $Context.Environment = @{
-        Directory         = (Get-Location).Path
-        PowerShellVersion = $PSVersionTable.PSVersion
-        IsElevated        = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        FilesInDirectory  = @(Get-ChildItem -Name -File | Select-Object -First 10)
-    }
-}
-
-function _Get-CommandContext {
-    param([hashtable]$Context)
-
-    $inputLine = $Context.InputLine
-    if ([string]::IsNullOrWhiteSpace($inputLine)) { return }
-
-    $tokens = $inputLine.Trim() -split '\s+'
-    if ($tokens.Count -gt 0) {
-        $commandName = $tokens[0]
-        $Context.ParsedCommand = @{
-            Name       = $commandName
-            Arguments  = $tokens[1..($tokens.Count - 1)]
-            IsComplete = $inputLine.EndsWith(' ')
-        }
-        
-        $commandInfo = Get-Command $commandName -ErrorAction SilentlyContinue
-        if ($commandInfo) {
-            $Context.ParsedCommand.Type = $commandInfo.CommandType
-            $Context.ParsedCommand.Parameters = @($commandInfo.Parameters.Keys)
-            $Context.HasComplexContext = $true
-        }
-    }
-}
-
-function _Get-FileTargetContext {
-    param([hashtable]$Context)
-
-    if (-not $Context.ParsedCommand) { return }
-
-    foreach ($arg in $Context.ParsedCommand.Arguments) {
-        if (Test-Path $arg -IsValid) {
-            $targetInfo = @{ Path = $arg; Exists = Test-Path $arg }
-            if ($targetInfo.Exists) {
-                try {
-                    $item = Get-Item $arg -ErrorAction Stop
-                    $targetInfo.Type = if ($item.PSIsContainer) { "Directory" } else { "File" }
-                    $targetInfo.Size = if (-not $item.PSIsContainer) { $item.Length } else { $null }
-                }
-                catch {
-                    # Could be a path that is valid but we don't have access to, ignore error
-                }
-            }
-            $Context.Targets += $targetInfo
-            $Context.HasTargets = $true
-        }
-    }
-}
-
-function _Get-GitContext {
-    param([hashtable]$Context)
-
-    # Check if we are in a git repo. Test-Path is faster than running git command.
-    if (Test-Path (Join-Path $Context.Environment.Directory ".git")) {
-        $Context.Environment.IsGitRepo = $true
-        try {
-            # Use -C to ensure we run git in the correct directory, regardless of PowerShell's current location
-            $gitBranch = git -C $Context.Environment.Directory branch --show-current 2>$null
-            $gitChanges = (git -C $Context.Environment.Directory status --porcelain 2>$null | Measure-Object).Count
-            
-            if ($gitBranch) { $Context.Environment.GitBranch = $gitBranch.Trim() }
-            if ($gitChanges -ge 0) { $Context.Environment.GitChanges = $gitChanges }
-        }
-        catch { } # Silently fail if git command fails
-    }
-    else {
-        $Context.Environment.IsGitRepo = $false
-    }
-}
-
-function _Get-SmartDefaultsContext {
-    param([hashtable]$Context)
-    
-    # Update smart defaults cache periodically (every 5 minutes)
-    $now = Get-Date
-    if (($now - $global:SmartDefaults.LastCacheUpdate).TotalMinutes -ge 5) {
-        try {
-            # Update recent commands with success/failure tracking
-            $recentHistory = Get-History -Count 50 -ErrorAction SilentlyContinue
-            $global:SmartDefaults.RecentCommands = $recentHistory | ForEach-Object {
-                @{
-                    Command   = $_.CommandLine
-                    Timestamp = $_.StartExecutionTime
-                    Success   = $null -ne $_.EndExecutionTime -and $_.ExecutionStatus -eq 'Completed'
-                    Duration  = if ($_.EndExecutionTime) { ($_.EndExecutionTime - $_.StartExecutionTime).TotalMilliseconds } else { $null }
-                }
-            }
-            
-            $global:SmartDefaults.LastCacheUpdate = $now
-        }
-        catch {
-            # Ignore cache update errors
-        }
-    }
-    
-    # Add smart defaults to context
-    $Context.SmartDefaults = @{
-        RecentSuccessfulCommands = $global:SmartDefaults.RecentCommands | Where-Object { $_.Success } | Select-Object -First 10
-        RecentFailedCommands     = $global:SmartDefaults.RecentCommands | Where-Object { -not $_.Success } | Select-Object -First 5
-        FastCommands            = $global:SmartDefaults.RecentCommands | Where-Object { $_.Duration -lt 1000 } | Select-Object -First 5
-    }
-}
-
-function _Get-DirectoryPatternContext {
-    param([hashtable]$Context)
-    
-    $currentDir = $Context.Environment.Directory
-    if (-not $global:SmartDefaults.DirectoryPatterns.ContainsKey($currentDir)) {
-        $global:SmartDefaults.DirectoryPatterns[$currentDir] = @()
-    }
-    
-    # Detect directory type and common patterns
-    $directoryType = "unknown"
-    $commonPatterns = @()
-    
-    # Check for project indicators
-    if (Test-Path (Join-Path $currentDir "package.json")) { 
-        $directoryType = "nodejs"
-        $commonPatterns = @("npm", "yarn", "node")
-    }
-    elseif (Test-Path (Join-Path $currentDir "requirements.txt") -or (Get-ChildItem "*.py" -ErrorAction SilentlyContinue)) { 
-        $directoryType = "python"
-        $commonPatterns = @("python", "pip", "pytest")
-    }
-    elseif (Test-Path (Join-Path $currentDir "*.csproj") -or (Test-Path (Join-Path $currentDir "*.sln"))) { 
-        $directoryType = "dotnet"
-        $commonPatterns = @("dotnet", "msbuild")
-    }
-    elseif (Get-ChildItem "*.ps1" -ErrorAction SilentlyContinue) { 
-        $directoryType = "powershell"
-        $commonPatterns = @("Test-Path", "Get-ChildItem", "Import-Module")
-    }
-    
-    $Context.DirectoryPattern = @{
-        Type = $directoryType
-        CommonCommands = $commonPatterns
-        PreviousCommands = $global:SmartDefaults.DirectoryPatterns[$currentDir]
-    }
-}
-
-function _Get-ErrorHistoryContext {
-    param([hashtable]$Context)
-    
-    # Get recent PowerShell errors
-    $recentErrors = Get-Variable Error -ValueOnly -ErrorAction SilentlyContinue | Select-Object -First 5
-    
-    $Context.ErrorHistory = @{
-        RecentErrors = $recentErrors | ForEach-Object {
-            @{
-                Message = $_.Exception.Message
-                CommandName = $_.InvocationInfo.MyCommand.Name
-                Line = $_.InvocationInfo.Line
-            }
-        }
-        FailedCommands = $global:SmartDefaults.ErrorHistory
-    }
-}
-
-function _Get-ModuleContext {
-    param([hashtable]$Context)
-    
-    $loadedModules = Get-Module | Select-Object Name, Version, ModuleType
-    $availableCommands = Get-Command | Where-Object { $_.Source } | 
-                        Group-Object Source | 
-                        Sort-Object Count -Descending | 
-                        Select-Object -First 10
-    
-    $Context.ModuleContext = @{
-        LoadedModules = $loadedModules
-        TopCommandSources = $availableCommands
-        RecentModuleImports = $global:SmartDefaults.RecentCommands | 
-                             Where-Object { $_.Command -like "Import-Module*" } | 
-                             Select-Object -First 5
-    }
-}
-
-function _Get-TriggerContext {
-    param([hashtable]$Context)
-    
-    # Check for @ triggers in input line for context injection
-    if ($Context.InputLine -match '@(\w+)\s*(.*)') {
-        $triggerName = $matches[1]
-        $triggerQuery = $matches[2].Trim()
-        
-        $Context.Trigger = @{
-            Name = $triggerName
-            Query = $triggerQuery
-            ProviderData = $null
-        }
-        
-        # Execute trigger provider if available
-        if ($global:SmartDefaults.TriggerProviders.ContainsKey($triggerName)) {
-            try {
-                $Context.Trigger.ProviderData = & $global:SmartDefaults.TriggerProviders[$triggerName]
-                $Context.HasComplexContext = $true
-            }
-            catch {
-                $Context.Trigger.ProviderData = @("Error loading $triggerName context: $($_.Exception.Message)")
-            }
-        }
-    }
-}
-
-function Get-EnhancedContext {
-    [CmdletBinding()]
-    param([string]$InputLine, [int]$CursorIndex = 0)
-    
-    $context = @{
-        InputLine         = $InputLine
-        CursorIndex       = $CursorIndex
-        Timestamp         = Get-Date
-        Environment       = @{} # Populated by providers
-        ParsedCommand     = $null # Populated by providers
-        Targets           = @()
-        HasComplexContext = $false
-        HasTargets        = $false
-    }
-    
-    $context.Timings = @{} # Add timings to the context object itself for logging
-    $totalContextTimeMs = 0
-
-    # Execute all registered context providers in order
-    foreach ($provider in $global:ContextProviders.GetEnumerator()) {
-        try {
-            $timing = Measure-Command {
-                & $provider.Value -context $context
-            }
-            $providerName = $provider.Name
-            $ms = [math]::Round($timing.TotalMilliseconds, 2)
-            $context.Timings[$providerName] = $ms
-            $totalContextTimeMs += $ms
-
-            # Update global metrics with a running average
-            $currentAvg = if ($global:PerformanceMetrics.ProviderTimings.ContainsKey($providerName)) { $global:PerformanceMetrics.ProviderTimings[$providerName] } else { 0 }
-            $global:PerformanceMetrics.ProviderTimings[$providerName] = ($currentAvg + $ms) / 2
-        }
-        catch {
-            if ($global:OllamaConfig.Performance.EnableDebug) {
-                Write-Warning "Context provider '$($provider.Name)' failed: $($_.Exception.Message)"
-            }
-        }
-    }
-    $global:PerformanceMetrics.TotalContextTime = ($global:PerformanceMetrics.TotalContextTime + $totalContextTimeMs) / 2
-    
-    return $context
-}
-
-function Update-RecentTargets {
-    [CmdletBinding()]
-    param([string]$Command)
-    
-    # Extract file paths from command
-    $pathPatterns = @(
-        '([a-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*)',
-        '(\\.\\[^\\/:*?"<>|\r\n]+(?:\\[^\\/:*?"<>|\r\n]+)*)',
-        '([^\\s]+\\.(?:ps1|psd1|psm1|txt|log|json|xml|csv|exe))'
-    )
-    
-    $foundPaths = @()
-    foreach ($pattern in $pathPatterns) {
-        $matches = [regex]::Matches($Command, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        foreach ($match in $matches) {
-            $path = $match.Groups[1].Value.Trim('"''')
-            if (Test-Path $path -IsValid) {
-                $foundPaths += $path
-            }
-        }
-    }
-    
-    if ($foundPaths) {
-        $global:RecentTargets = (@($foundPaths) + @($global:RecentTargets) | 
-            Select-Object -Unique -First $global:OllamaConfig.Performance.RecentTargetsCount)
-    }
-}
-
-# --------------------------------------------------------------------------------------------------------
-# JSON-FIRST OLLAMA API INTEGRATION
-# --------------------------------------------------------------------------------------------------------
-
-function Invoke-OllamaCompletion {
-    [CmdletBinding()]
-    param(
-        [hashtable]$RequestPayload,         # Complete API payload from prompt builders
-        [string]$Endpoint = "/api/generate", # API endpoint - default to generate like working example
-        [int]$TimeoutMs = 30000            # Request timeout in milliseconds
+        [string]$Level = "Info",
+        [string]$Component,
+        [string]$Message,
+        [object]$Data = $null
     )
 
-    if (-not (Test-OllamaConnection)) {
-        throw "Ollama connection not available"
-    }
-
-    $global:PerformanceMetrics.RequestCount++
-    $startTime = Get-Date
-
-    try {
-        # Direct REST call like the working example - no job needed
-        $uri = "$($global:OllamaConfig.Server.ApiUrl)$Endpoint"
-        $body = $RequestPayload | ConvertTo-Json -Depth 3
-
-        $result = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json' -TimeoutSec ($TimeoutMs / 1000)
-
-        # Update performance metrics
-        $latency = ((Get-Date) - $startTime).TotalMilliseconds
-        $global:PerformanceMetrics.AverageLatency = ($global:PerformanceMetrics.AverageLatency + $latency) / 2
-        $global:PerformanceMetrics.SuccessRate = ($global:PerformanceMetrics.SuccessRate * 0.95) + 0.05
-
-        # Return simplified response structure
-        return @{
-            response = $result.response  # Direct response like working example
-            latency_ms = $latency
-            endpoint = $Endpoint
-            model = $RequestPayload.model
-            success = $true
-        }
-    }
-    catch {
-        # Update failure metrics
-        $global:PerformanceMetrics.SuccessRate = $global:PerformanceMetrics.SuccessRate * 0.9
-
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "⚠️ Ollama request failed: $($_.Exception.Message)" -ForegroundColor Yellow
-            if ($RequestPayload.model) {
-                Write-Host "   Model: $($RequestPayload.model), Endpoint: $Endpoint" -ForegroundColor Gray
-            }
-        }
-        throw
-    }
-}
-
-function Build-AutocompletePrompt {
-    [CmdletBinding()]
-    param(
-        [string]$InputLine,
-        [hashtable]$Context = @{},
-        [string]$ModelName = $global:AUTOCOMPLETE_MODEL
-    )
-
-    # Simple prompt like the working example
-    $prompt = "Complete the following PowerShell command: $InputLine"
-
-    # Match the working example structure - no JSON format, no streaming
-    return @{
-        model = $ModelName
-        prompt = $prompt
-        stream = $false
-        options = @{
-            num_predict = 80    # From model config
-            temperature = 0.1   # From model config
-            top_p = 0.8        # From model config
-        }
-    }
-}
-
-function Build-CoderPrompt {
-    [CmdletBinding()]
-    param(
-        [string]$InputLine,
-        [hashtable]$Context = @{},
-        [string]$ModelName = $global:CODER_MODEL
-    )
-
-    # Build simple context description
-    $contextParts = @()
-
-    if ($Context.Environment.Directory) {
-        $contextParts += "in $($Context.Environment.Directory)"
-    }
-
-    if ($Context.Environment.IsGitRepo) {
-        $contextParts += "git branch: $($Context.Environment.GitBranch)"
-    }
-
-    # Simple prompt format like the working example
-    $prompt = if ($contextParts.Count -gt 0) {
-        "PowerShell command completion $($contextParts -join ', '): $InputLine"
+    # Check if logging is enabled for this level...
+    # TODO take off debug when finished debugging
+    $logLevels = @{ Debug = 0; Info = 1; Warning = 2; Error = 3 }
+    $currentLevel = if ([PowerAugerPredictor]::LogLevel) {
+        $logLevels[[PowerAugerPredictor]::LogLevel]
     } else {
-        "Complete the following PowerShell command: $InputLine"
+        $logLevels["Debug"]
     }
 
-    # Match the working example structure - no JSON format, no streaming, no chat messages
-    return @{
-        model = $ModelName
-        prompt = $prompt
-        stream = $false
-        options = @{
-            num_predict = 150   # From model config
-            temperature = 0.4   # From model config
-            top_p = 0.85       # From model config
-        }
-    }
-}
+    if ($logLevels[$Level] -lt $currentLevel) { return }
 
-function Build-RankerPrompt {
-    [CmdletBinding()]
-    param(
-        [string]$Query,
-        [string]$Completion,
-        [hashtable]$Context = @{},
-        [string]$ModelName = $global:RANKER_MODEL
-    )
-    
-    # Build context summary for evaluation
-    $contextSummary = @()
-    if ($Context.Environment.Directory) { 
-        $contextSummary += "Dir: $($Context.Environment.Directory)" 
-    }
-    if ($Context.Environment.IsGitRepo) { 
-        $contextSummary += "Git: $($Context.Environment.GitBranch)" 
-    }
-    if ($Context.Environment.FilesInDirectory) { 
-        $contextSummary += "Files: $($Context.Environment.FilesInDirectory.Count)" 
-    }
-    if ($Context.Environment.IsElevated) {
-        $contextSummary += "Elevated: Yes"
-    }
-    
-    # Structured evaluation prompt
-    $evaluationPrompt = @"
-Query: "$Query"
-Completion: "$Completion"
-Context: $($contextSummary -join ', ')
+    # Prepare log entry
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $logEntry = "$timestamp [$Level] [$Component] $Message"
 
-Evaluate the relevance and quality of this PowerShell completion.
-"@
-    
-    # Streamlined payload for precise evaluation - modelfile handles system prompt and parameters
-    return @{
-        model = $ModelName
-        prompt = $evaluationPrompt      # Use generate endpoint for efficiency
-        format = "json"
-        stream = $false                 # Ranking needs complete response for accuracy
-        keep_alive = "1m"
+    if ($Data) {
+        $logEntry += " | Data: $(if ($Data -is [hashtable] -or $Data -is [PSObject]) {
+            $Data | ConvertTo-Json -Compress -Depth 3
+        } else {
+            $Data.ToString()
+        })"
     }
-}
 
-# --------------------------------------------------------------------------------------------------------
-# INTELLIGENT CACHING SYSTEM
-# --------------------------------------------------------------------------------------------------------
-
-function Get-CachedPrediction {
-    [CmdletBinding()]
-    param([string]$CacheKey, [scriptblock]$Generator)
-    
-    $now = Get-Date
-    
-    # Check cache
-    if ($global:PredictionCache.ContainsKey($CacheKey)) {
-        $cached = $global:PredictionCache[$CacheKey]
-        if (($now - $cached.Timestamp).TotalSeconds -lt $global:OllamaConfig.Performance.CacheTimeout) {
-            $global:PerformanceMetrics.CacheHits++
-            return $cached.Result
-        }
+    # Determine log file
+    $logPath = [PowerAugerPredictor]::GetLogPath()
+    if (-not (Test-Path $logPath)) {
+        New-Item -ItemType Directory -Path $logPath -Force | Out-Null
     }
-    
-    # Generate new result
-    $result = & $Generator
-    
-    if ($result) {
-        # Clean cache if too large
-        if ($global:PredictionCache.Count -gt $global:OllamaConfig.Performance.CacheSize) {
-            $oldestKeys = $global:PredictionCache.GetEnumerator() | 
-            Sort-Object { $_.Value.Timestamp } | 
-            Select-Object -First 50 | 
-            ForEach-Object { $_.Key }
-            foreach ($key in $oldestKeys) {
-                $global:PredictionCache.Remove($key)
-            }
-        }
-        
-        $global:PredictionCache[$CacheKey] = @{
-            Result    = $result
-            Timestamp = $now
-        }
-    }
-    
-    return $result
-}
 
-# --------------------------------------------------------------------------------------------------------
-# FALLBACK PREDICTION SYSTEM
-# --------------------------------------------------------------------------------------------------------
-
-function Get-HistoryBasedSuggestions {
-    [CmdletBinding()]
-    param([string]$InputLine)
-    
-    if ([string]::IsNullOrWhiteSpace($InputLine)) {
-        return @()
+    $logFile = switch ($Component) {
+        "TabExpansion2" { Join-Path $logPath "tabexpansion2.log" }
+        "OllamaAPI" { Join-Path $logPath "ollama_api.log" }
+        default { Join-Path $logPath "powerauger.log" }
     }
-    
+
+    # Write to file (append for current session)
     try {
-        # Get from PowerShell history
-        $historySuggestions = Get-History | 
-        Select-Object -ExpandProperty CommandLine |
-        Where-Object { $_ -like "$InputLine*" } |
-        Select-Object -Unique -First 5
-        
-        # Convert to JSON format for consistency
-        return @{
-            completions = @($historySuggestions)
-            confidence  = 0.6
-            context     = "history_fallback"
-        }
+        $logEntry | Add-Content -Path $logFile -Encoding UTF8
+    } catch {
+        # Log to console if file write fails
+        Write-Host "[LOG ERROR] Failed to write to $logFile : $_" -ForegroundColor Red
+        Write-Host $logEntry -ForegroundColor Yellow
     }
-    catch {
-        return @{
-            completions = @()
-            confidence  = 0.0
-            context     = "fallback_failed"
-        }
+
+    # Also output to console if Warning or Error
+    if ($Level -in @("Warning", "Error")) {
+        Write-Host $logEntry -ForegroundColor $(if ($Level -eq "Error") { "Red" } else { "Yellow" })
     }
 }
 
-# --------------------------------------------------------------------------------------------------------
-# MAIN PREDICTION ENGINE - FIXED RETURN VALUES
-# --------------------------------------------------------------------------------------------------------
+class PowerAugerPredictor : ICommandPredictor {
+    [guid] $Id
+    [string] $Name
+    [string] $Description
 
-function Get-CommandPrediction {
-    [CmdletBinding()]
-    param(
-        [string]$InputLine,
-        [int]$CursorIndex = 0
-    )
-    
-    try {
-        # Empty input handling
-        if ([string]::IsNullOrWhiteSpace($InputLine)) {
-            $historyResult = Get-HistoryBasedSuggestions -InputLine ""
-            return $historyResult.completions
-        }
-        
-        # Get enhanced context
-        $context = Get-EnhancedContext -InputLine $InputLine -CursorIndex $CursorIndex
-        
-        # Update recent targets
-        if ($global:CommandHistory) {
-            $lastCommand = $global:CommandHistory | Select-Object -Last 1
-            if ($lastCommand -and $lastCommand.Command -ne $InputLine) {
-                Update-RecentTargets -Command $lastCommand.Command
-            }
-        }
-        
-        # Select optimal model
-        $modelConfig = Select-OptimalModel -InputLine $InputLine -Context $context
-        $cacheKey = "$($modelConfig.Name)_$($InputLine.GetHashCode())_$($context.Environment.Directory.GetHashCode())"
-        
-        # Get cached or generate new predictions
-        $result = Get-CachedPrediction -CacheKey $cacheKey -Generator {
-            try {
-                # Build appropriate prompt based on model type
-                $requestPayload = $null
-                $endpoint = "/api/chat"
+    # Removed simple cache - using contextual history instead
 
-                if ($modelConfig.Name -eq $global:AUTOCOMPLETE_MODEL) {
-                    # Fast autocomplete
-                    $requestPayload = Build-AutocompletePrompt -InputLine $InputLine -Context $context
-                }
-                elseif ($modelConfig.Name -eq $global:CODER_MODEL) {
-                    # Context-aware coder
-                    $requestPayload = Build-CoderPrompt -InputLine $InputLine -Context $context
-                }
-                else {
-                    # Default to autocomplete for unknown models
-                    $requestPayload = Build-AutocompletePrompt -InputLine $InputLine -Context $context
-                }
+    # Configuration
+    hidden static [string] $Model = "qwen2.5-0.5B-autocomplete-custom"
+    hidden static [string] $ApiUrl = "http://127.0.0.1:11434"
 
-                # Call API with properly constructed payload
-                $apiResult = Invoke-OllamaCompletion -RequestPayload $requestPayload -Endpoint "/api/generate" -TimeoutMs $modelConfig.Timeout
-
-                # Simple text response handling like the working example
-                if ($apiResult.success -and $apiResult.response) {
-                    # The response is just plain text now
-                    $completionText = $apiResult.response
-
-                    # Split the response into multiple suggestions if it contains newlines or pipes
-                    $completions = @()
-                    if ($completionText) {
-                        # Clean up the response and split into suggestions
-                        $suggestions = $completionText -split '[\r\n|;]' |
-                                      ForEach-Object { $_.Trim() } |
-                                      Where-Object { $_ -and $_ -ne $InputLine }
-
-                        if ($suggestions) {
-                            $completions = @($suggestions | Select-Object -First 3)
-                        } else {
-                            # If no split, just use the whole response as one suggestion
-                            $completions = @($completionText.Trim())
-                        }
-                    }
-
-                    if ($completions.Count -gt 0) {
-                        return @{
-                            completions = $completions
-                            model = $modelConfig.Name
-                            latency_ms = $apiResult.latency_ms
-                        }
-                    }
-                }
-
-                # If no valid response, fall back to history
-                throw "No valid response from API"
-            }
-            catch {
-                # Fallback to history-based suggestions
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "API call failed, using history fallback: $_" -ForegroundColor Yellow
-                }
-                Get-HistoryBasedSuggestions -InputLine $InputLine
-            }
-        }
-        
-        # FIXED: Convert to consistent format - handle both strings and objects
-        $finalCompletions = @()
-        if ($result -and $result.completions) {
-            $finalCompletions = $result.completions | ForEach-Object { 
-                if ($_ -is [string]) { 
-                    $_ 
-                } 
-                elseif ($_.text) { 
-                    $_.text 
-                } 
-                else { 
-                    $_.ToString()
-                }
-            } | Where-Object { $_ -and $_.Trim() }
-        }
-        elseif ($result -is [array]) {
-            # Handle cases where raw array is returned
-            $finalCompletions = $result
-        }
-
-        # --- Acceptance Tracking: Increment "Offered" Count ---
-        # Use the result context (e.g., 'history_fallback') or the model name as the identifier
-        $modelIdentifier = if ($result.context) { $result.context } else { $modelConfig.Name }
-        if (-not $global:PerformanceMetrics.AcceptanceTracking.ContainsKey($modelIdentifier)) {
-            $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier] = @{ Accepted = 0; Offered = 0; Errors = 0 }
-        }
-        # Only count as "offered" if we actually produced suggestions
-        if ($finalCompletions.Count -gt 0) {
-            $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Offered++
-        }
-        # --- End Acceptance Tracking ---
-
-        # NEW: Log prediction if enabled
-        if ($global:OllamaConfig.Performance.EnablePredictionLogging) {
-            $logEntry = @{
-                Timestamp    = Get-Date
-                InputLine    = $InputLine
-                ModelUsed    = $modelIdentifier # Use the more accurate identifier
-                ResultSource = $modelIdentifier
-                Predictions  = $finalCompletions
-                Timings      = $context.Timings
-                CacheKey     = $cacheKey
-            }
-            $global:PredictionLog.Add($logEntry)
-            # Trim log if it gets too big to prevent memory issues
-            if ($global:PredictionLog.Count -gt 500) {
-                $global:PredictionLog.RemoveRange(0, $global:PredictionLog.Count - 500)
-            }
-        }
-
-        return $finalCompletions
-    }
-    catch {
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "⚠️ Prediction error: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-        $fallbackResult = Get-HistoryBasedSuggestions -InputLine $InputLine
-        # Ensure fallback also returns a consistent format
-        return if ($fallbackResult.completions) { $fallbackResult.completions } else { @() }
-    }
-}
-
-# --------------------------------------------------------------------------------------------------------
-# COMMAND HISTORY AND FEEDBACK SYSTEM
-# --------------------------------------------------------------------------------------------------------
-
-function Add-CommandToHistory {
-    [CmdletBinding()]
-    param(
-        [string]$Command,
-        [bool]$Success = $true,
-        [string]$ErrorMessage = ""
-    )
-    
-    # --- Acceptance Tracking: Check if this command was an accepted prediction ---
-    if ($global:PredictionLog.Count -gt 0) {
-        $lastPrediction = $global:PredictionLog[-1]
-        
-        # To be an "acceptance", the executed command must start with the input that generated
-        # the prediction, and it must exactly match one of the suggestions.
-        if ($Command.StartsWith($lastPrediction.InputLine) -and ($lastPrediction.Predictions -contains $Command)) {
-            $modelIdentifier = $lastPrediction.ModelUsed
-            if ($global:PerformanceMetrics.AcceptanceTracking.ContainsKey($modelIdentifier)) {
-                $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Accepted++
-                # NEW: Track if the accepted command resulted in an error
-                if (-not $Success) {
-                    $global:PerformanceMetrics.AcceptanceTracking[$modelIdentifier].Errors++
-                }
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Host "✅ Prediction accepted for model '$modelIdentifier'" -ForegroundColor DarkGreen
-                }
-            }
-        }
-    }
-    
-    $entry = @{
-        Command   = $Command
-        Success   = $Success
-        Error     = $ErrorMessage
-        Timestamp = Get-Date
-        Directory = Get-Location
-    }
-    
-    $global:CommandHistory += $entry
-    
-    # Trim history if too large
-    if ($global:CommandHistory.Count -gt $global:OllamaConfig.Performance.MaxHistoryLines) {
-        $startIndex = $global:CommandHistory.Count - $global:OllamaConfig.Performance.MaxHistoryLines
-        $global:CommandHistory = $global:CommandHistory[$startIndex..($global:CommandHistory.Count - 1)]
-    }
-    
-    # Update recent targets
-    Update-RecentTargets -Command $Command
-}
-
-function Clear-PowerAugerCache {
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param()
-    <#
-    .SYNOPSIS
-    Clears the in-memory prediction cache and deletes the cache file from disk.
-    #>
-
-    if ($pscmdlet.ShouldProcess("the prediction cache in memory and on disk ($($global:PowerAugerCacheFile))")) {
-        $global:PredictionCache.Clear()
-        if (Test-Path $global:PowerAugerCacheFile) {
-            try {
-                Remove-Item -Path $global:PowerAugerCacheFile -Force -ErrorAction Stop
-                Write-Host "✅ Prediction cache file removed." -ForegroundColor Green
-            }
-            catch { Write-Warning "Failed to remove cache file: $($_.Exception.Message)" }
-        }
-        Write-Host "✅ In-memory prediction cache cleared." -ForegroundColor Green
-    }
-}
-# --------------------------------------------------------------------------------------------------------
-# PERFORMANCE MONITORING AND DIAGNOSTICS
-# --------------------------------------------------------------------------------------------------------
-
-function Get-PredictorStatistics {
-    [CmdletBinding()]
-    param()
-    
-    $stats = @{
-        Performance = $global:PerformanceMetrics.Clone()
-        Cache       = @{
-            Size    = $global:PredictionCache.Count
-            MaxSize = $global:OllamaConfig.Performance.CacheSize
-            HitRate = if ($global:PerformanceMetrics.RequestCount -gt 0) { 
-                [math]::Round(($global:PerformanceMetrics.CacheHits / $global:PerformanceMetrics.RequestCount) * 100, 1) 
-            }
-            else { 0 }
-        }
-        Connection  = @{
-            Status       = if ($global:OllamaConfig.Server.IsConnected) { "Connected" } else { "Disconnected" }
-            TunnelActive = $null -ne $global:OllamaConfig.Server.TunnelProcess -and -not $global:OllamaConfig.Server.TunnelProcess.HasExited
-        }
-        History     = @{
-            CommandCount  = $global:CommandHistory.Count
-            RecentTargets = $global:RecentTargets.Count
-        }
-    }
-    
-    # Add calculated acceptance rates
-    $stats.AcceptanceRates = @{}
-    foreach ($modelEntry in $global:PerformanceMetrics.AcceptanceTracking.GetEnumerator()) {
-        $modelName = $modelEntry.Name
-        $accepted = $modelEntry.Value.Accepted
-        $offered = $modelEntry.Value.Offered
-        $errors = $modelEntry.Value.Errors
-        $rate = if ($offered -gt 0) { [math]::Round(($accepted / $offered) * 100, 1) } else { 0 }
-        $errorRate = if ($accepted -gt 0) { [math]::Round(($errors / $accepted) * 100, 1) } else { 0 }
-        
-        $stats.AcceptanceRates[$modelName] = @{
-            Accepted  = $accepted
-            Offered   = $offered
-            Rate      = $rate
-            Errors    = $errors
-            ErrorRate = $errorRate
-        }
-    }
-    
-    return $stats
-}
-
-function Show-PredictorStatus {
-    [CmdletBinding()]
-    param()
-    
-    $stats = Get-PredictorStatistics
-    
-    Write-Host "🤖 Ollama PowerShell Predictor Status" -ForegroundColor Cyan
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Gray
-    Write-Host "Connection: " -NoNewline -ForegroundColor White
-    if ($stats.Connection.Status -eq "Connected") {
-        Write-Host $stats.Connection.Status -ForegroundColor Green
-    }
-    else {
-        Write-Host $stats.Connection.Status -ForegroundColor Red
-    }
-    
-    Write-Host "Requests: $($stats.Performance.RequestCount)" -ForegroundColor White
-    Write-Host "Cache Hit Rate: $($stats.Cache.HitRate)%" -ForegroundColor White
-    Write-Host "Avg API Latency: $([math]::Round($stats.Performance.AverageLatency, 0))ms" -ForegroundColor White
-    Write-Host "Avg Context Time: $([math]::Round($stats.Performance.TotalContextTime, 1))ms" -ForegroundColor White
-    Write-Host "Success Rate: $([math]::Round($stats.Performance.SuccessRate * 100, 1))%" -ForegroundColor White
-    Write-Host ""
-    Write-Host "Models:" -ForegroundColor White
-    Write-Host "  - Fast:    $($global:OllamaConfig.Models.FastCompletion.Name)" -ForegroundColor Gray
-    Write-Host "  - Context: $($global:OllamaConfig.Models.ContextAware.Name)" -ForegroundColor Gray
-    
-    if ($stats.AcceptanceRates.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Acceptance Rate:" -ForegroundColor White
-        foreach ($rateEntry in ($stats.AcceptanceRates.GetEnumerator() | Sort-Object Name)) {
-            $line = "  - {0,-25}: {1}% ({2}/{3})" -f $rateEntry.Name, $rateEntry.Value.Rate, $rateEntry.Value.Accepted, $rateEntry.Value.Offered
-            if ($rateEntry.Value.Accepted -gt 0) {
-                $line += " | Errors: $($rateEntry.Value.ErrorRate)% ($($rateEntry.Value.Errors))"
-            }
-            $color = if ($rateEntry.Value.Errors -gt 0) { "Yellow" } else { "Gray" }
-            Write-Host $line -ForegroundColor $color
-        }
+    # Logging configuration
+    hidden static [string] $LogLevel = "Debug"  # Debug, Info, Warning, Error
+    hidden static [string] $_LogPath = ""  # Private backing field
+    hidden static [hashtable] $LogLevels = @{
+        Debug = 0
+        Info = 1
+        Warning = 2
+        Error = 3
     }
 
-    Write-Host ""
-}
+    # Persistent contextual history path
+    hidden static [string] $ContextualHistoryPath = "$env:LOCALAPPDATA\PowerAuger\contextual_history.json"
 
-function Get-PredictionLog {
-    [CmdletBinding()]
-    param(
-        [int]$Last = 50
-    )
-    <#
-    .SYNOPSIS
-    Retrieves the log of recent predictions for troubleshooting.
-    #>
-    
-    $count = [math]::Min($Last, $global:PredictionLog.Count)
-    if ($count -gt 0) {
-        # Return in reverse chronological order (most recent first)
-        return $global:PredictionLog[($global:PredictionLog.Count - 1)..($global:PredictionLog.Count - $count)]
+    # History context
+    hidden static [System.Collections.Concurrent.ConcurrentBag[object]] $HistoryExamples = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    # Enhanced contextual learning system (hashtable with command|path keys)
+    hidden static [hashtable] $ContextualHistory = [hashtable]::Synchronized(@{})
+    hidden static [int] $MaxContextualHistorySize = 300
+
+    # Background prediction infrastructure with thread-safe message passing
+    hidden static [System.Management.Automation.Runspaces.Runspace] $PredictionRunspace = $null
+    hidden static [System.Management.Automation.PowerShell] $PredictionPowerShell = $null
+
+    # Thread-safe message queues for communication with background runspace
+    hidden static [System.Collections.Concurrent.BlockingCollection[hashtable]] $MessageQueue = [System.Collections.Concurrent.BlockingCollection[hashtable]]::new(100)  # Max 100 items
+    hidden static [System.Collections.Concurrent.BlockingCollection[hashtable]] $LogQueue = [System.Collections.Concurrent.BlockingCollection[hashtable]]::new(200)  # Async logging queue
+    hidden static [System.Collections.Concurrent.ConcurrentDictionary[string,object]] $ResponseCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+
+    # Channel for real-time updates (PowerShell 7+)
+    hidden static [System.Threading.Channels.Channel[hashtable]] $UpdateChannel = [System.Threading.Channels.Channel]::CreateUnbounded[hashtable]()
+
+    # Cancellation token for clean shutdown
+    hidden static [System.Threading.CancellationTokenSource] $CancellationSource = [System.Threading.CancellationTokenSource]::new()
+
+    # Shutdown mutex for cleanup synchronization
+    hidden static [System.Threading.Mutex] $ShutdownMutex = [System.Threading.Mutex]::new($false)
+
+    # Background running state
+    hidden static [bool] $IsBackgroundRunning = $false
+
+    # Static method to get LogPath (workaround for PowerShell static property limitations)
+    hidden static [string] GetLogPath() {
+        if (-not [PowerAugerPredictor]::_LogPath) {
+            [PowerAugerPredictor]::_LogPath = "$env:LOCALAPPDATA\PowerAuger\logs"
+        }
+        return [PowerAugerPredictor]::_LogPath
     }
-    return @()
-}
-# --------------------------------------------------------------------------------------------------------
-# INITIALIZATION AND CLEANUP
-# --------------------------------------------------------------------------------------------------------
 
-function Register-PowerAugerCleanupEvents {
-    [CmdletBinding()]
-    param()
+    PowerAugerPredictor() {
+        $this.Id = [guid]::Parse('a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+        $this.Name = 'PowerAuger'
+        $this.Description = 'Ollama-powered AI completions with history learning'
 
-    try {
-        # PowerShell exit event (primary cleanup)
-        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-            try {
-                Save-PowerAugerState
-            }
-            catch {
-                # Silent cleanup - errors during shutdown are not critical
-            }
-        } | Out-Null
-
-        # .NET AppDomain exit event (backup cleanup for unexpected exits)
-        $cleanupAction = {
-            try {
-                Save-PowerAugerState
-            }
-            catch {
-                # Silent cleanup
-            }
-        }
-
-        # Register .NET ProcessExit event for more reliable cleanup
-        [System.AppDomain]::CurrentDomain.add_ProcessExit($cleanupAction)
-
-        # Windows console control event (Ctrl+C, system shutdown, etc.)
-        if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
-            try {
-                # Use P/Invoke to handle Windows console control events
-                Add-Type -TypeDefinition @"
-                    using System;
-                    using System.Runtime.InteropServices;
-
-                    public static class ConsoleHelper {
-                        public delegate bool ConsoleCtrlDelegate(int dwCtrlType);
-
-                        [DllImport("kernel32.dll")]
-                        public static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
-
-                        public const int CTRL_C_EVENT = 0;
-                        public const int CTRL_BREAK_EVENT = 1;
-                        public const int CTRL_CLOSE_EVENT = 2;
-                        public const int CTRL_LOGOFF_EVENT = 5;
-                        public const int CTRL_SHUTDOWN_EVENT = 6;
-
-                        public static bool ConsoleCtrlHandler(int dwCtrlType) {
-                            try {
-                                // Call PowerShell function for cleanup
-                                System.Management.Automation.PowerShell.Create().AddScript("Save-PowerAugerState").Invoke();
-                                return true;
-                            } catch {
-                                return false;
-                            }
-                        }
-                    }
-"@ -ErrorAction SilentlyContinue
-
-                # Register the console control handler
-                $handler = [ConsoleHelper+ConsoleCtrlDelegate] {
-                    param($ctrlType)
-                    try {
-                        Save-PowerAugerState
-                        return $true
-                    }
-                    catch {
-                        return $false
-                    }
-                }
-
-                [ConsoleHelper]::SetConsoleCtrlHandler($handler, $true)
-            }
-            catch {
-                # P/Invoke setup failed, continue with other cleanup methods
-                if ($global:OllamaConfig.Performance.EnableDebug) {
-                    Write-Warning "Could not register Windows console control handler: $($_.Exception.Message)"
-                }
-            }
-        }
-
-        # WMI system shutdown event (Windows-specific)
+        # Clear logs at session start
         try {
-            Register-WmiEvent -Query "SELECT * FROM Win32_SystemShutdownEvent" -Action {
-                try {
-                    Save-PowerAugerState
+            $logPath = [PowerAugerPredictor]::GetLogPath()
+            if (-not (Test-Path $logPath)) {
+                New-Item -ItemType Directory -Path $logPath -Force | Out-Null
+            }
+            # Clear existing log files for fresh session
+            @("tabexpansion2.log", "ollama_api.log", "powerauger.log") | ForEach-Object {
+                $logFile = Join-Path $logPath $_
+                if (Test-Path $logFile) {
+                    Clear-Content -Path $logFile -Force
                 }
-                catch {
-                    # Silent cleanup
+            }
+        } catch {
+            Write-Warning "Failed to clear log files: $_"
+        }
+
+        Write-PowerAugerLog -Level "Info" -Component "Initialization" -Message "PowerAuger predictor starting"
+
+        # Load contextual history from disk
+        try {
+            if (Test-Path ([PowerAugerPredictor]::ContextualHistoryPath)) {
+                $historyData = Get-Content ([PowerAugerPredictor]::ContextualHistoryPath) -Raw | ConvertFrom-Json -AsHashtable
+                foreach ($key in $historyData.Keys) {
+                    [PowerAugerPredictor]::ContextualHistory[$key] = $historyData[$key]
                 }
-            } -ErrorAction SilentlyContinue | Out-Null
+                Write-PowerAugerLog -Level "Info" -Component "Initialization" `
+                    -Message "Loaded $([PowerAugerPredictor]::ContextualHistory.Count) contextual history entries"
+            }
+        } catch {
+            Write-PowerAugerLog -Level "Warning" -Component "Initialization" `
+                -Message "Failed to load contextual history" -Data $_
+        }
+
+        # Pre-load some history examples on initialization
+        $this.LoadHistoryExamples()
+
+        # Start background prediction engine if not already running
+        if (-not [PowerAugerPredictor]::IsBackgroundRunning) {
+            Write-PowerAugerLog -Level "Info" -Component "Initialization" -Message "Starting background engine"
+            $this.StartBackgroundPredictionEngine()
+            Write-PowerAugerLog -Level "Info" -Component "Initialization" -Message "Background engine started: $([PowerAugerPredictor]::IsBackgroundRunning)"
+        }
+
+        Write-PowerAugerLog -Level "Info" -Component "Initialization" -Message "Constructor completed successfully"
+    }
+
+    hidden [hashtable] GetStandardizedContext([string]$inputText, [int]$cursorPos, $tabCompletions = $null) {
+        try {
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+            # Only call TabExpansion2 if not provided and input is long enough
+            if ($null -eq $tabCompletions -and $inputText.Length -ge [PowerAugerPredictor]::MinTabExpansionLength) {
+                if (Get-Command TabExpansion2 -ErrorAction SilentlyContinue) {
+                    $tabStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    $tabCompletions = TabExpansion2 -inputScript $inputText -cursorColumn $cursorPos
+                    $tabStopwatch.Stop()
+
+                    Write-PowerAugerLog -Level "Debug" -Component "TabExpansion2" `
+                        -Message "TabExpansion2 took $($tabStopwatch.ElapsedMilliseconds)ms" `
+                        -Data @{
+                            Input = $inputText
+                            CursorPos = $cursorPos
+                            MatchCount = if ($tabCompletions) { $tabCompletions.CompletionMatches.Count } else { 0 }
+                        }
+                }
+            }
+
+            # Group completions by type (first 3 of each group for consistency)
+            $contextGroups = @{}
+            if ($tabCompletions -and $tabCompletions.CompletionMatches.Count -gt 0) {
+                $groups = $tabCompletions.CompletionMatches | Group-Object ResultType
+                foreach ($group in $groups | Select-Object -First 3) {
+                    $contextGroups[$group.Name] = $group.Group |
+                        Select-Object -First 3 -ExpandProperty CompletionText
+                }
+            }
+
+            $stopwatch.Stop()
+            Write-PowerAugerLog -Level "Debug" -Component "Context" `
+                -Message "Context building took $($stopwatch.ElapsedMilliseconds)ms"
+
+            # Build standardized context
+            return @{
+                Groups = $contextGroups
+                Directory = $PWD.Path
+                IsGitRepo = (Test-Path (Join-Path $PWD.Path ".git"))
+                DirName = (Split-Path $PWD.Path -Leaf)
+                Timestamp = Get-Date
+                TabCompletions = $tabCompletions  # Pass along to avoid duplicate call
+            }
         }
         catch {
-            # WMI events might not be available in all environments
-        }
+            Write-PowerAugerLog -Level "Error" -Component "Context" `
+                -Message "Failed to build context" -Data $_
 
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Host "✅ Registered cleanup events for state persistence" -ForegroundColor Green
-        }
-    }
-    catch {
-        if ($global:OllamaConfig.Performance.EnableDebug) {
-            Write-Warning "Some cleanup events could not be registered: $($_.Exception.Message)"
-        }
-    }
-}
-
-function Initialize-OllamaPredictor {
-    [CmdletBinding()]
-    param(
-        [switch]$EnableDebug,
-        [switch]$NoPrewarm
-    )
-
-    # Load configuration from file first, which may enable debug mode or change settings
-    Load-PowerAugerConfiguration
-
-    if ($EnableDebug) {
-        $global:OllamaConfig.Performance.EnableDebug = $true
-    }
-
-    Write-Host "🚀 Initializing Ollama PowerShell Predictor..." -ForegroundColor Cyan
-
-    Load-PowerAugerState
-
-    # Test local Ollama connection
-    $connected = Test-OllamaConnection
-    if (-not $connected) {
-        Write-Host "⚠️ Could not connect to local Ollama. Predictor will use fallback mode." -ForegroundColor Yellow
-        Write-Host "   Ensure Ollama is running locally on $($global:OllamaConfig.Server.ApiUrl)" -ForegroundColor Yellow
-    }
-    elseif (-not $NoPrewarm) {
-        # Pre-warm models to reduce first-use latency
-        Write-Host "🔥 Pre-warming models in the background... (this may take a moment)" -ForegroundColor Yellow
-
-        foreach ($modelEntry in $global:ModelRegistry.GetEnumerator()) {
-            $modelName = $modelEntry.Value.Name
-            $keepAlive = $modelEntry.Value.KeepAlive
-
-            # Use a fire-and-forget job to load the model
-            Start-Job -ScriptBlock {
-                param($modelToWarm, $keepAliveSetting, $apiUrl, $debugEnabled)
-
-                if ($debugEnabled) {
-                    Write-Host "  - Sending pre-warm request to '$modelToWarm'..."
-                }
-
-                $body = @{
-                    model      = $modelToWarm
-                    prompt     = "Pre-warming model" # Simple prompt, just to load it
-                    stream     = $false
-                    keep_alive = $keepAliveSetting
-                } | ConvertTo-Json
-
-                try {
-                    # Use a long timeout because model loading can be slow.
-                    # The job runs in the background, so it won't block the user.
-                    $null = Invoke-RestMethod -Uri "$apiUrl/api/generate" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 120 -ErrorAction Stop
-                }
-                catch {
-                    # This is a background job, so we can't easily show warnings. The failure is non-critical.
-                }
-            } -ArgumentList $modelName, $keepAlive, $global:OllamaConfig.Server.ApiUrl, $global:OllamaConfig.Performance.EnableDebug | Out-Null
-        }
-    }
-    
-    # Register comprehensive cleanup events for Windows
-    Register-PowerAugerCleanupEvents
-    
-    # Register command feedback (if available)
-    Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action {
-        try {
-            $lastCmd = Get-History -Count 1 -ErrorAction SilentlyContinue
-            if ($lastCmd -and ($null -eq $global:LastProcessedCommandId -or $lastCmd.Id -gt $global:LastProcessedCommandId)) {
-                $global:LastProcessedCommandId = $lastCmd.Id
-                Add-CommandToHistory -Command $lastCmd.CommandLine -Success $? -ErrorMessage $(if (-not $?) { $Error[0].Exception.Message } else { "" })
+            # Return minimal context on error
+            return @{
+                Groups = @{}
+                Directory = $PWD.Path
+                IsGitRepo = $false
+                DirName = (Split-Path $PWD.Path -Leaf)
+                Timestamp = Get-Date
+                TabCompletions = $null
             }
         }
-        catch { }
-    } | Out-Null
-    
-    Write-Host "✅ Ollama PowerShell Predictor initialized!" -ForegroundColor Green
-    Show-PredictorStatus
-}
+    }
 
-# --------------------------------------------------------------------------------------------------------
-# CONFIGURATION MANAGEMENT
-# --------------------------------------------------------------------------------------------------------
+    hidden [string] BuildContextAwarePrompt([string]$inputText, [hashtable]$currentContext) {
+        $prompt = ""
 
-function Set-PredictorConfiguration {
-    [CmdletBinding()]
-    param(
-        [string]$LinuxHost,
-        [int]$LocalPort,
-        [switch]$EnableDebug,
-        [int]$CacheTimeout,
-        [int]$CacheSize
-    )
-    
-    if ($LinuxHost) { $global:OllamaConfig.Server.LinuxHost = $LinuxHost }
-    if ($LocalPort) { $global:OllamaConfig.Server.LocalPort = $LocalPort }
-    if ($EnableDebug.IsPresent) { $global:OllamaConfig.Performance.EnableDebug = $EnableDebug }
-    if ($CacheTimeout) { $global:OllamaConfig.Performance.CacheTimeout = $CacheTimeout }
-    if ($CacheSize) { $global:OllamaConfig.Performance.CacheSize = $CacheSize }
-    
-    # Update API URL
-    $global:OllamaConfig.Server.ApiUrl = "http://localhost:$($global:OllamaConfig.Server.LocalPort)"
-
-    # Persist configuration changes
-    Save-PowerAugerConfiguration
-}
-
-# --------------------------------------------------------------------------------------------------------
-# EXPANSION STRATEGY HOOKS
-# --------------------------------------------------------------------------------------------------------
-
-# Context Provider Registry with enhanced providers from legacy analysis
-# This ordered dictionary defines the context providers and their execution order.
-# Each value is a scriptblock that accepts a single [hashtable]$Context parameter.
-$global:ContextProviders = [ordered]@{
-    'Environment'    = { param($Context) _Get-EnvironmentContext -Context $Context }
-    'Command'        = { param($Context) _Get-CommandContext -Context $Context }
-    'FileTarget'     = { param($Context) _Get-FileTargetContext -Context $Context }
-    'Git'            = { param($Context) _Get-GitContext -Context $Context }
-    'SmartDefaults'  = { param($Context) _Get-SmartDefaultsContext -Context $Context }
-    'DirectoryPattern' = { param($Context) _Get-DirectoryPatternContext -Context $Context }
-    'ErrorHistory'   = { param($Context) _Get-ErrorHistoryContext -Context $Context }
-    'ModuleContext'  = { param($Context) _Get-ModuleContext -Context $Context }
-    'TriggerContext' = { param($Context) _Get-TriggerContext -Context $Context }
-    # Future providers: Azure, AWS, Docker, Kubernetes, etc.
-}
-
-# Smart defaults for command success tracking and pattern recognition
-$global:SmartDefaults = @{
-    CommandSuccess    = @{}    # Track which commands typically succeed
-    DirectoryPatterns = @{}    # Common command patterns per directory type  
-    RecentCommands    = @()    # Last 50 commands with success/failure tracking
-    ErrorHistory      = @()    # Commands that failed recently
-    LastCacheUpdate   = (Get-Date).AddDays(-1)
-    TriggerProviders  = @{     # @ trigger system for context injection
-        'files'   = { Get-ChildItem -Name -File | Select-Object -First 20 }
-        'dirs'    = { Get-ChildItem -Name -Directory | Select-Object -First 10 }
-        'git'     = { 
-            if (Test-Path .git) {
-                @(
-                    "Branch: $(git branch --show-current 2>$null)"
-                    "Status: $(git status --porcelain 2>$null | Measure-Object | Select-Object -ExpandProperty Count) changes"
-                    "Recent: $(git log --oneline -5 2>$null | ForEach-Object { ($_ -split ' ')[1..100] -join ' ' } | Select-Object -First 3)"
-                )
-            } else { @() }
+        # Build compact TabExpansion2 context - just grab completion texts
+        $tabContext = ""
+        if ($currentContext.TabCompletions -and $currentContext.TabCompletions.CompletionMatches.Count -gt 0) {
+            # Just take first 50 completion texts, no filtering
+            $completions = $currentContext.TabCompletions.CompletionMatches |
+                Select-Object -First 50 -ExpandProperty CompletionText
+            $tabContext = ($completions -join ',')
         }
-        'history' = { Get-History -Count 20 | Select-Object -ExpandProperty CommandLine }
-        'errors'  = { $global:SmartDefaults.ErrorHistory | Select-Object -First 5 }
-        'modules' = { Get-Module | Select-Object -ExpandProperty Name | Select-Object -First 15 }
-        'env'     = { 
-            @(
-                "SSH: $($null -ne $env:SSH_CLIENT)"
-                "PWD: $(Get-Location)"
-                "User: $env:USERNAME"
-                "PS: $($PSVersionTable.PSVersion)"
-                "Elevated: $([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
-            )
+
+        # Find matching contexts from history with same path
+        $exactMatches = @()
+        foreach ($kvp in [PowerAugerPredictor]::ContextualHistory.GetEnumerator()) {
+            $entry = $kvp.Value
+            if ($entry.Context -and $entry.Context.Directory -eq $currentContext.Directory) {
+                $exactMatches += $entry
+            }
+        }
+
+        # Sort by acceptance count and take top 2
+        $exactMatches = $exactMatches | Sort-Object -Property AcceptedCount -Descending | Select-Object -First 2
+
+        # Add history examples with full context format
+        foreach ($match in $exactMatches) {
+            if ($match.Input -and $match.Completion) {
+                # Build historical context from stored completions
+                $histContext = ""
+                if ($match.Context.TabCompletions -and $match.Context.TabCompletions.CompletionMatches.Count -gt 0) {
+                    $histCompletions = $match.Context.TabCompletions.CompletionMatches |
+                        Select-Object -First 50 -ExpandProperty CompletionText
+                    $histContext = ($histCompletions -join ',')
+                }
+                $prompt += "<|fim_prefix|>$($match.Context.Directory)|$histContext|$($match.Input)<|fim_suffix|><|fim_middle|>$($match.Completion)`n"
+            }
+        }
+
+        # Add current request with full context
+        $prompt += "<|fim_prefix|>$($currentContext.Directory)|$tabContext|$inputText<|fim_suffix|><|fim_middle|>"
+
+        return $prompt
+    }
+
+    hidden [void] StartBackgroundPredictionEngine() {
+        try {
+            # Create runspace for background predictions
+            [PowerAugerPredictor]::PredictionRunspace = [runspacefactory]::CreateRunspace()
+            [PowerAugerPredictor]::PredictionRunspace.Open()
+
+            # Pass thread-safe message queues and channel to the runspace
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('MessageQueue', [PowerAugerPredictor]::MessageQueue)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('LogQueue', [PowerAugerPredictor]::LogQueue)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ResponseCache', [PowerAugerPredictor]::ResponseCache)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('UpdateChannel', [PowerAugerPredictor]::UpdateChannel)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('CancellationToken', [PowerAugerPredictor]::CancellationSource.Token)
+
+            # Pass read-only configuration values (not shared references)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('Model', [PowerAugerPredictor]::Model)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ApiUrl', [PowerAugerPredictor]::ApiUrl)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('LogLevel', [PowerAugerPredictor]::LogLevel)
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('LogPath', [PowerAugerPredictor]::GetLogPath())
+
+            # Create deep copies of history for the background runspace
+            $historyCopy = @()
+            foreach ($item in [PowerAugerPredictor]::HistoryExamples) {
+                $historyCopy += @{ Prefix = $item.Prefix; Completion = $item.Completion }
+            }
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('HistoryExamples', $historyCopy)
+
+            # Create a snapshot of contextual history
+            $contextHistoryCopy = @{}
+            foreach ($key in [PowerAugerPredictor]::ContextualHistory.Keys) {
+                $value = [PowerAugerPredictor]::ContextualHistory[$key]
+                $contextHistoryCopy[$key] = @{
+                    FullCommand = $value.FullCommand
+                    Input = $value.Input
+                    Completion = $value.Completion
+                    Context = if ($value.Context) { $value.Context.Clone() } else { $null }
+                    AcceptedCount = $value.AcceptedCount
+                    LastUsed = $value.LastUsed
+                }
+            }
+            [PowerAugerPredictor]::PredictionRunspace.SessionStateProxy.SetVariable('ContextualHistory', $contextHistoryCopy)
+
+            # Create the background script with proper message passing
+            $backgroundScript = {
+                # Define logging function for background runspace
+                function Write-BackgroundLog {
+                    param(
+                        [string]$Level = "Info",
+                        [string]$Component,
+                        [string]$Message,
+                        [object]$Data = $null
+                    )
+
+                    $logLevels = @{ Debug = 0; Info = 1; Warning = 2; Error = 3 }
+                    $currentLevel = $logLevels[$LogLevel]
+                    if ($logLevels[$Level] -lt $currentLevel) { return }
+
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+                    $logEntry = "$timestamp [$Level] [BG:$Component] $Message"
+
+                    if ($Data) {
+                        $logEntry += " | Data: $(if ($Data -is [hashtable] -or $Data -is [PSObject]) {
+                            $Data | ConvertTo-Json -Compress -Depth 3
+                        } else {
+                            $Data.ToString()
+                        })"
+                    }
+
+                    $logFile = switch ($Component) {
+                        "TabExpansion2" { Join-Path $LogPath "tabexpansion2.log" }
+                        "OllamaAPI" { Join-Path $LogPath "ollama_api.log" }
+                        default { Join-Path $LogPath "powerauger.log" }
+                    }
+
+                    try {
+                        $logEntry | Add-Content -Path $logFile -Encoding UTF8
+                    } catch {}
+                }
+
+                # Local cache for the background runspace (not shared)
+                $localCache = @{}
+                $lastSaveTime = Get-Date
+                $saveIntervalMinutes = 5
+
+                # Check for cancellation
+                while (-not $CancellationToken.IsCancellationRequested) {
+                    try {
+                        # Process log messages first (non-blocking)
+                        $logRequest = $null
+                        while ($LogQueue.TryTake([ref]$logRequest, 0)) {  # 0ms timeout, drain all logs
+                            try {
+                                # Write the log using the background log function
+                                if ($logRequest.Data) {
+                                    Write-BackgroundLog -Level $logRequest.Level -Component $logRequest.Component `
+                                        -Message $logRequest.Message -Data $logRequest.Data
+                                } else {
+                                    Write-BackgroundLog -Level $logRequest.Level -Component $logRequest.Component `
+                                        -Message $logRequest.Message
+                                }
+                            } catch {
+                                # Silent fail on log errors
+                            }
+                        }
+
+                        # Use BlockingCollection for thread-safe message retrieval with cancellation support
+                        $request = $null
+                        if ($MessageQueue.TryTake([ref]$request, 200, $CancellationToken)) {
+                            # Get context for this request if provided
+                            $currentContext = $request.Context
+                            if (-not $currentContext) {
+                                # Fallback to simple context if not provided
+                                $currentContext = @{
+                                    Groups = @{}
+                                    Directory = $PWD.Path
+                                    DirName = (Split-Path $PWD.Path -Leaf)
+                                    IsGitRepo = $false
+                                }
+                            }
+
+                            # Build FIM prompt with full context
+                            $fimPrompt = ""
+
+                            # Get TabExpansion2 completions for context (quick and dirty)
+                            $tabContext = ""
+                            try {
+                                $tabCompletions = TabExpansion2 -inputScript $request.Input -cursorColumn $request.Input.Length
+                                if ($tabCompletions -and $tabCompletions.CompletionMatches.Count -gt 0) {
+                                    # Just grab first 50 completion texts
+                                    $completions = $tabCompletions.CompletionMatches |
+                                        Select-Object -First 50 -ExpandProperty CompletionText
+                                    $tabContext = ($completions -join ',')
+                                }
+                            } catch {
+                                # Ignore TabExpansion2 errors
+                            }
+
+                            # Find matching contexts from history with same directory
+                            $exactMatches = @()
+                            foreach ($kvp in $ContextualHistory.GetEnumerator()) {
+                                $entry = $kvp.Value
+                                if ($entry.Context -and $entry.Context.Directory -eq $currentContext.Directory) {
+                                    $exactMatches += $entry
+                                }
+                            }
+
+                            # Sort and take top 2 matches
+                            $exactMatches = $exactMatches | Sort-Object -Property AcceptedCount -Descending | Select-Object -First 2
+
+                            # Add history examples with full context
+                            foreach ($match in $exactMatches) {
+                                if ($match.Input -and $match.Completion) {
+                                    # Get stored completions if available
+                                    $histContext = ""
+                                    if ($match.Context.TabCompletions -and $match.Context.TabCompletions.CompletionMatches.Count -gt 0) {
+                                        $histCompletions = $match.Context.TabCompletions.CompletionMatches |
+                                            Select-Object -First 50 -ExpandProperty CompletionText
+                                        $histContext = ($histCompletions -join ',')
+                                    }
+                                    $fimPrompt += "<|fim_prefix|>$($match.Context.Directory)|$histContext|$($match.Input)<|fim_suffix|><|fim_middle|>$($match.Completion)`n"
+                                }
+                            }
+
+                            # Add current request with full context
+                            $fimPrompt += "<|fim_prefix|>$($currentContext.Directory)|$tabContext|$($request.Input)<|fim_suffix|><|fim_middle|>"
+
+                            # Call Ollama API
+                            $body = @{
+                                model = $Model
+                                prompt = $fimPrompt
+                                stream = $false
+                                options = @{
+                                    num_predict = 80
+                                    temperature = 0.2
+                                    top_p = 0.9
+                                }
+                            } | ConvertTo-Json -Depth 3
+
+                            Write-BackgroundLog -Level "Debug" -Component "OllamaAPI" `
+                                -Message "Sending request" -Data @{
+                                    Input = $request.Input
+                                    PromptLength = $fimPrompt.Length
+                                    Model = $Model
+                                }
+
+                            $apiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                            $response = Invoke-RestMethod -Uri "$ApiUrl/api/generate" `
+                                                         -Method Post -Body $body `
+                                                         -ContentType 'application/json' `
+                                                         -TimeoutSec 5 -ErrorAction Stop
+                            $apiStopwatch.Stop()
+
+                            Write-BackgroundLog -Level "Debug" -Component "OllamaAPI" `
+                                -Message "Response received in $($apiStopwatch.ElapsedMilliseconds)ms" `
+                                -Data @{
+                                    ResponseLength = if ($response.response) { $response.response.Length } else { 0 }
+                                    TotalDuration = $response.total_duration
+                                    LoadDuration = $response.load_duration
+                                    EvalDuration = $response.eval_duration
+                                }
+
+                            if ($response.response) {
+                                # Add to local cache
+                                $localCache[$request.Input] = @{
+                                    Completion = $response.response.Trim()
+                                    Timestamp = Get-Date
+                                }
+
+                                # Send response back through thread-safe dictionary
+                                $responseData = @{
+                                    Completion = $response.response.Trim()
+                                    Timestamp = Get-Date
+                                }
+                                [void]$ResponseCache.TryAdd($request.Input, $responseData)
+
+                                # Send update through channel for real-time notification
+                                $updateMessage = @{
+                                    Type = 'PredictionComplete'
+                                    Input = $request.Input
+                                    Completion = $response.response.Trim()
+                                    QueueCount = $MessageQueue.Count
+                                    Timestamp = Get-Date
+                                }
+                                [void]$UpdateChannel.Writer.TryWrite($updateMessage)
+                            }
+                        }
+
+                        # Send startup notification (removed broken pre-warming)
+                        if ($localCache.Count -eq 0 -and -not $localCache.ContainsKey('_initialized')) {
+                            # Send startup notification
+                            [void]$UpdateChannel.Writer.TryWrite(@{
+                                Type = 'BackgroundStarted'
+                                QueueCount = $MessageQueue.Count
+                            })
+                            # Mark that we've initialized
+                            $localCache['_initialized'] = @{ Completion = "true"; Timestamp = Get-Date }
+                        }
+
+                        # Keep response cache synchronized but don't save to disk
+                        if ((Get-Date) - $lastSaveTime -gt [TimeSpan]::FromMinutes($saveIntervalMinutes)) {
+                            try {
+                                # Sync local cache to ResponseCache for main thread access
+                                if ($localCache.Count -gt 1) {
+                                    foreach ($key in $localCache.Keys) {
+                                        if ($key -notmatch '^_') {
+                                            [void]$ResponseCache.TryAdd($key, $localCache[$key])
+                                        }
+                                    }
+                                    $lastSaveTime = Get-Date
+                                }
+                            } catch {
+                                # Silent fail - don't disrupt background processing
+                            }
+                        }
+
+                        # No sleep needed - BlockingCollection.TryTake handles timeout
+                    }
+                    catch [System.OperationCanceledException] {
+                        # Clean cancellation requested
+                        break
+                    }
+                    catch {
+                        # Continue on error unless cancelled
+                        if ($CancellationToken.IsCancellationRequested) { break }
+                        Start-Sleep -Milliseconds 500
+                    }
+                }
+
+                # Cleanup on exit
+                try {
+                    # Send shutdown notification
+                    [void]$UpdateChannel.Writer.TryWrite(@{
+                        Type = 'BackgroundStopping'
+                        QueueCount = 0
+                    })
+
+                    # No longer saving old cache file - using contextual history instead
+
+                    # Complete the channel
+                    $UpdateChannel.Writer.TryComplete()
+                } catch {}
+
+                Write-Host "Background prediction engine stopped cleanly" -ForegroundColor Yellow
+            }
+
+            # Start the background PowerShell
+            [PowerAugerPredictor]::PredictionPowerShell = [PowerShell]::Create()
+            [PowerAugerPredictor]::PredictionPowerShell.Runspace = [PowerAugerPredictor]::PredictionRunspace
+
+            # Add script and begin invoke - NO ARGUMENTS since we're using shared variables
+            [void][PowerAugerPredictor]::PredictionPowerShell.AddScript($backgroundScript)
+
+            [void][PowerAugerPredictor]::PredictionPowerShell.BeginInvoke()
+            [PowerAugerPredictor]::IsBackgroundRunning = $true
+        }
+        catch {
+            # Background engine failed to start, fall back to sync mode
+            [PowerAugerPredictor]::IsBackgroundRunning = $false
+        }
+    }
+
+    hidden [void] LoadHistoryExamples() {
+        try {
+            $history = Get-History -Count 50 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine.Length -gt [PowerAugerPredictor]::MinHistoryExampleLength }
+
+            [PowerAugerPredictor]::HistoryExamples.Clear()
+
+            foreach ($cmd in $history | Select-Object -Last 20) {
+                $line = $cmd.CommandLine
+                # Find good split points for FIM examples
+                if ($line.Length -gt [PowerAugerPredictor]::MinSplitLength) {
+                    $splitPoint = [Math]::Floor($line.Length * 0.6)
+                    [PowerAugerPredictor]::HistoryExamples.Add(@{
+                        Prefix = $line.Substring(0, $splitPoint)
+                        Completion = $line.Substring($splitPoint)
+                    })
+                }
+            }
+        } catch {
+            Write-PowerAugerLog -Level "Warning" -Component "LoadHistoryExamples" `
+                -Message "Failed to load history examples" -Data $_
+        }
+    }
+
+    [SuggestionPackage] GetSuggestion([PredictionClient] $client, [PredictionContext] $context, [System.Threading.CancellationToken] $cancellationToken) {
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            # Get the input text
+            $inputText = $context.InputAst.Extent.Text
+
+            # Queue log message instead of direct file I/O
+            [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                Level = "Debug"
+                Component = "GetSuggestion"
+                Message = "Called with input: $inputText"
+                Timestamp = Get-Date
+            }, 0)
+
+            # Generate context for this input (will call TabExpansion2 once)
+            $currentContext = $this.GetStandardizedContext($inputText, $inputText.Length, $null)
+
+            # Create suggestions list
+            $suggestions = [System.Collections.Generic.List[PredictiveSuggestion]]::new()
+
+            # Use TabExpansion2 results from context (avoiding duplicate call!)
+            $tabCompletions = $currentContext.TabCompletions
+            try {
+
+                if ($tabCompletions -and $tabCompletions.CompletionMatches.Count -gt 0) {
+                    # Group by type and get commands first
+                    $commands = $tabCompletions.CompletionMatches |
+                        Where-Object { $_.ResultType -eq [System.Management.Automation.CompletionResultType]::Command } |
+                        Select-Object -First 5
+
+                    # If no commands, take whatever we got
+                    if ($commands.Count -eq 0) {
+                        $commands = $tabCompletions.CompletionMatches | Select-Object -First 5
+                    }
+
+                    # Enhance with contextual history
+                    foreach ($tab in $commands) {
+                        if ($suggestions.Count -ge 3) { break }
+
+                        # Extract command name (first word)
+                        $cmdName = if ($tab.ResultType -eq [System.Management.Automation.CompletionResultType]::Command) {
+                            $tab.CompletionText
+                        } else {
+                            ($inputText -split '\s+')[0]
+                        }
+
+                        # Try to find in contextual history with new key format
+                        $historyKey = "$($PWD.Path)|$($tab.CompletionText)"
+
+                        $history = if ([PowerAugerPredictor]::ContextualHistory.ContainsKey($historyKey)) {
+                            [PowerAugerPredictor]::ContextualHistory[$historyKey]
+                        } else {
+                            $null
+                        }
+
+                        if ($history) {
+                            # Use the full historical command
+                            $suggestions.Add([PredictiveSuggestion]::new(
+                                $history.FullCommand,
+                                "History: Used $($history.AcceptedCount)x"
+                            ))
+                        } else {
+                            # Use raw TabExpansion2 result
+                            $suggestions.Add([PredictiveSuggestion]::new(
+                                $tab.CompletionText,
+                                "Tab: $($tab.ResultType)"
+                            ))
+                        }
+                    }
+                }
+            } catch {
+                # Queue error log
+                [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                    Level = "Warning"
+                    Component = "GetSuggestion"
+                    Message = "TabExpansion2 processing failed: $_"
+                    Timestamp = Get-Date
+                }, 0)
+            }
+
+            # If still no suggestions, try contextual history as fallback
+            if ($suggestions.Count -eq 0) {
+                # Try to find a match in contextual history with new key format
+                $historyKey = "$($PWD.Path)|$inputText"
+
+                $historyMatch = if ([PowerAugerPredictor]::ContextualHistory.ContainsKey($historyKey)) {
+                    [PowerAugerPredictor]::ContextualHistory[$historyKey]
+                } else {
+                    $null
+                }
+
+                if ($historyMatch -and $historyMatch.FullCommand -and $historyMatch.FullCommand.StartsWith($inputText)) {
+                    $suggestions.Add([PredictiveSuggestion]::new(
+                        $historyMatch.FullCommand,
+                        "History: Used $($historyMatch.AcceptedCount)x"
+                    ))
+                }
+
+                # If STILL no suggestions, provide basic fallback for common prefixes
+                if ($suggestions.Count -eq 0) {
+                    $fallbacks = @{
+                        'Get-Ch' = 'Get-ChildItem'
+                        'Get-Co' = 'Get-Content'
+                        'Get-Pr' = 'Get-Process'
+                        'Set-Lo' = 'Set-Location'
+                        'New-It' = 'New-Item'
+                        'Remove-It' = 'Remove-Item'
+                    }
+
+                    foreach ($prefix in $fallbacks.Keys) {
+                        if ($inputText -like "$prefix*") {
+                            $suggestions.Add([PredictiveSuggestion]::new(
+                                $fallbacks[$prefix],
+                                "Fallback"
+                            ))
+                            break
+                        }
+                    }
+                }
+            }
+
+            # Queue AI completion - just use whatever we have
+            if ([PowerAugerPredictor]::IsBackgroundRunning -and
+                [PowerAugerPredictor]::MessageQueue.Count -lt 50 -and
+                -not [PowerAugerPredictor]::ResponseCache.ContainsKey($inputText)) {
+
+                # Send message to background runspace
+                $message = @{
+                    Input = $inputText
+                    Context = $currentContext.Clone()  # Clone to avoid shared references
+                }
+                $queued = [PowerAugerPredictor]::MessageQueue.TryAdd($message, 100)
+
+                # Log the queue attempt
+                [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                    Level = "Debug"
+                    Component = "GetSuggestion"
+                    Message = "Queue attempt for '$inputText': $queued, Queue count: $([PowerAugerPredictor]::MessageQueue.Count)"
+                    Timestamp = Get-Date
+                }, 0)
+            } else {
+                # Log why we didn't queue
+                [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                    Level = "Debug"
+                    Component = "GetSuggestion"
+                    Message = "Skipped queue for '$inputText' - BG:$([PowerAugerPredictor]::IsBackgroundRunning) Q:$([PowerAugerPredictor]::MessageQueue.Count) Cached:$([PowerAugerPredictor]::ResponseCache.ContainsKey($inputText))"
+                    Timestamp = Get-Date
+                }, 0)
+            }
+
+            # ALWAYS return at least one suggestion for testing
+            if ($suggestions.Count -eq 0) {
+                $suggestions.Add([PredictiveSuggestion]::new(
+                    "Get-ChildItem",
+                    "HARDCODED TEST"
+                ))
+            }
+
+            # Return suggestions if we have any
+            $stopwatch.Stop()
+
+            # Queue completion log
+            [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                Level = "Debug"
+                Component = "GetSuggestion"
+                Message = "Completed in $($stopwatch.ElapsedMilliseconds)ms with $($suggestions.Count) suggestions"
+                Timestamp = Get-Date
+            }, 0)
+
+            if ($suggestions.Count -gt 0) {
+                return [SuggestionPackage]::new($suggestions)
+            }
+        } catch {
+            # Queue error log
+            [void][PowerAugerPredictor]::LogQueue.TryAdd(@{
+                Level = "Error"
+                Component = "GetSuggestion"
+                Message = "Failed to get suggestions: $_"
+                Timestamp = Get-Date
+            }, 0)
+            # Return null on any error - don't break PSReadLine
+        } finally {
+            if ($stopwatch.IsRunning) {
+                $stopwatch.Stop()
+            }
+        }
+
+        return $null
+    }
+
+    [void] OnCommandLineAccepted([string] $commandLine) {
+        # Store both simple and contextual history
+            try {
+                # Generate FULL context for the accepted command (with null TabCompletions parameter)
+                $acceptedContext = $this.GetStandardizedContext($commandLine, $commandLine.Length, $null)
+
+                # Use full path and input as key
+                $key = "$($PWD.Path)|$commandLine"
+
+                # Find the split point for FIM format - split at first space for command name
+                $firstSpace = $commandLine.IndexOf(' ')
+                $splitPoint = if ($firstSpace -gt 0) { $firstSpace } else { $commandLine.Length }
+                $prefix = $commandLine.Substring(0, $splitPoint)
+                $completion = if ($splitPoint -lt $commandLine.Length) {
+                    $commandLine.Substring($splitPoint)
+                } else {
+                    ""
+                }
+
+                # Check if we have this key already
+                if ([PowerAugerPredictor]::ContextualHistory.ContainsKey($key)) {
+                    # Update existing entry
+                    $existing = [PowerAugerPredictor]::ContextualHistory[$key]
+                    $existing.AcceptedCount++
+                    $existing.LastUsed = Get-Date
+
+                    # Update to longer/more complete command if applicable
+                    if ($commandLine.Length -gt $existing.FullCommand.Length) {
+                        $existing.FullCommand = $commandLine
+                        $existing.Input = $prefix
+                        $existing.Completion = $completion
+                        $existing.Context = $acceptedContext  # Update with new context
+                    }
+                } else {
+                    # Add new entry with simple key but FULL context value
+                    [PowerAugerPredictor]::ContextualHistory[$key] = @{
+                        FullCommand = $commandLine
+                        Input = $prefix
+                        Completion = $completion
+                        Context = $acceptedContext  # Full rich context preserved
+                        AcceptedCount = 1
+                        LastUsed = Get-Date
+                    }
+                }
+
+                # Prune old entries if history is too large
+                if ([PowerAugerPredictor]::ContextualHistory.Count -gt [PowerAugerPredictor]::MaxContextualHistorySize) {
+                    # Find least recently used entries
+                    $entries = [PowerAugerPredictor]::ContextualHistory.GetEnumerator() |
+                        Sort-Object { $_.Value.LastUsed }
+
+                    $toRemove = $entries |
+                        Select-Object -First ([PowerAugerPredictor]::ContextualHistory.Count - [PowerAugerPredictor]::MaxContextualHistorySize) |
+                        Select-Object -ExpandProperty Key
+
+                    foreach ($removeKey in $toRemove) {
+                        [PowerAugerPredictor]::ContextualHistory.Remove($removeKey)
+                    }
+                }
+
+                # Also maintain simple history for backward compatibility
+                # ConcurrentBag doesn't support RemoveAt, so just add without pruning
+                # The bag will grow but it's thread-safe
+                [PowerAugerPredictor]::HistoryExamples.Add(@{
+                    Prefix = $prefix
+                    Completion = $completion
+                })
+            } catch {
+                Write-PowerAugerLog -Level "Warning" -Component "OnCommandLineAccepted" `
+                    -Message "Failed to track history" -Data $_
+            }
+
+    }
+
+    [void] OnCommandLineExecuted([string] $commandLine) {
+        # Called after command execution - can be used for feedback
+    }
+
+    [void] OnCommandLineCleared() {
+        # Could clear cache here if desired
+    }
+}
+
+# Function to save AI cache to disk
+function Save-PowerAugerCache {
+    try {
+        $historyPath = [PowerAugerPredictor]::ContextualHistoryPath
+        $historyDir = Split-Path -Path $historyPath -Parent
+        if (-not (Test-Path $historyDir)) {
+            New-Item -ItemType Directory -Path $historyDir -Force | Out-Null
+        }
+
+        # Convert contextual history to serializable format
+        $historyData = @{}
+        foreach ($key in [PowerAugerPredictor]::ContextualHistory.Keys) {
+            $historyData[$key] = [PowerAugerPredictor]::ContextualHistory[$key]
+        }
+
+        $historyData | ConvertTo-Json -Depth 4 | Set-Content -Path $historyPath -Force
+        Write-Host "Saved $($historyData.Count) contextual history entries to $historyPath" -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to save contextual history: $_"
+    }
+}
+
+# Function to set log level
+function Set-PowerAugerLogLevel {
+    param(
+        [ValidateSet("Debug", "Info", "Warning", "Error")]
+        [string]$Level = "Info"
+    )
+
+    [PowerAugerPredictor]::LogLevel = $Level
+    Write-PowerAugerLog -Level "Info" -Component "Configuration" `
+        -Message "Log level set to: $Level"
+
+    if ($Level -eq "Debug") {
+        Write-Host "PowerAuger debug logging enabled. Logs will be written to:" -ForegroundColor Yellow
+        Write-Host "  $([PowerAugerPredictor]::GetLogPath())" -ForegroundColor Cyan
+    }
+}
+
+# Function to load contextual history from disk
+function Import-PowerAugerCache {
+    try {
+        $historyPath = [PowerAugerPredictor]::ContextualHistoryPath
+        if (Test-Path $historyPath) {
+            $historyData = Get-Content -Path $historyPath -Raw | ConvertFrom-Json -AsHashtable
+
+            foreach ($key in $historyData.Keys) {
+                [PowerAugerPredictor]::ContextualHistory[$key] = $historyData[$key]
+            }
+
+            Write-Host "Loaded $($historyData.Count) contextual history entries" -ForegroundColor Green
+        } else {
+            Write-Host "No contextual history file found at $historyPath" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Warning "Failed to load contextual history: $_"
+    }
+}
+
+# Debug function to access internal state
+function Get-PowerAugerState {
+    @{
+        IsBackgroundRunning = [PowerAugerPredictor]::IsBackgroundRunning
+        ContextualHistoryCount = [PowerAugerPredictor]::ContextualHistory.Count
+        ResponseCacheCount = [PowerAugerPredictor]::ResponseCache.Count
+        ContextualHistoryKeys = @([PowerAugerPredictor]::ContextualHistory.Keys)
+        QueueCount = [PowerAugerPredictor]::MessageQueue.Count
+        MaxQueueSize = 100
+        ContextualHistoryPath = [PowerAugerPredictor]::ContextualHistoryPath
+        RunspaceState = if ([PowerAugerPredictor]::PredictionRunspace) { [PowerAugerPredictor]::PredictionRunspace.RunspaceStateInfo.State } else { "Not created" }
+        IsCancellationRequested = [PowerAugerPredictor]::CancellationSource.IsCancellationRequested
+    }
+}
+
+# Function to get the PowerAuger cat with dynamic coloring based on queue count
+function Get-PowerAugerCat {
+    param(
+        [int]$QueueCount = 0
+    )
+
+    # Simple gradient colors
+    $colors = @(
+        @(166, 226, 46),   # Green
+        @(174, 129, 255),  # Purple
+        @(253, 151, 31)    # Orange
+    )
+
+    # Cat characters: ᓚ (tail) ᘏ (body) ᗢ (head)
+    $catChars = @('ᓚ', 'ᘏ', 'ᗢ')
+
+    # Determine stress level (0-2)
+    $stressLevel = if ($QueueCount -eq 0) { 0 }
+                   elseif ($QueueCount -le 20) { 1 }
+                   else { 2 }
+
+    $esc = [char]0x1b
+    $rgb = $colors[$stressLevel]
+
+    # Build cat with selected color
+    $catDisplay = "${esc}[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m"
+    $catDisplay += $catChars -join ''
+    $catDisplay += "${esc}[0m"
+
+    return $catDisplay
+}
+
+# Function to set up PowerAuger-enhanced prompt with queue health cat
+function Set-PowerAugerPrompt {
+    # Store the original prompt if not already saved
+    if (-not $global:PowerAugerOriginalPrompt) {
+        $global:PowerAugerOriginalPrompt = (Get-Content function:prompt -ErrorAction SilentlyContinue)
+    }
+
+    # Define the custom prompt function globally
+    function global:prompt {
+        # Check for channel updates first (event-driven, no timers)
+        Update-PowerAugerFromChannel
+
+        # Get current queue count
+        $queueCount = 0
+        try {
+            $queueCount = [PowerAugerPredictor]::MessageQueue.Count
+        } catch {}
+
+        # Use the cat from channel updates if available, otherwise calculate
+        if ($null -eq $global:PowerAugerCurrentCat -or $queueCount -ne $global:PowerAugerCurrentQueueCount) {
+            $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $queueCount
+            $global:PowerAugerCurrentQueueCount = $queueCount
+        }
+
+        # Return the complete prompt string with cat and proper formatting
+        "$global:PowerAugerCurrentCat $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+    }
+
+    Write-Host "PowerAuger gradient cat prompt enabled!" -ForegroundColor Green
+    Write-Host "The cat ᓚᘏᗢ changes color based on AI queue pressure (green→purple→orange)" -ForegroundColor Cyan
+}
+
+# Function to process channel updates (non-blocking)
+function Update-PowerAugerChannelMessages {
+    try {
+        # Check for updates from the background thread
+        $reader = [PowerAugerPredictor]::UpdateChannel.Reader
+
+        # Process all available messages (non-blocking)
+        while ($reader.TryRead([ref]$update)) {
+            switch ($update.Type) {
+                'PredictionComplete' {
+                    # Update cat based on new queue count
+                    if ($update.QueueCount -ne $global:PowerAugerCurrentQueueCount) {
+                        $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $update.QueueCount
+                        $global:PowerAugerCurrentQueueCount = $update.QueueCount
+                    }
+                    # DO NOT manipulate PSReadLine buffer - it causes issues
+                }
+
+                'BackgroundStarted' {
+                    # Update cat for initial state
+                    $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $update.QueueCount
+                    $global:PowerAugerCurrentQueueCount = $update.QueueCount
+                }
+
+                'BackgroundStopping' {
+                    # Reset cat to idle state
+                    $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount 0
+                    $global:PowerAugerCurrentQueueCount = 0
+                }
+
+                'CacheSaved' {
+                    # Optional: Could show a brief notification
+                }
+            }
+        }
+    } catch {
+        # Log but don't disrupt prompt
+        Write-Debug "PowerAuger channel update error: $_"
+    }
+}
+
+# Function to process channel updates when prompt is displayed
+# This is called from the prompt function itself - no timers needed
+function Update-PowerAugerFromChannel {
+    try {
+        $reader = [PowerAugerPredictor]::UpdateChannel.Reader
+        $latestQueueCount = -1
+
+        # Process all pending updates from channel
+        while ($reader.TryRead([ref]$update)) {
+            if ($update.QueueCount -ge 0) {
+                $latestQueueCount = $update.QueueCount
+            }
+        }
+
+        # Update cat if we got a new queue count
+        if ($latestQueueCount -ge 0 -and $latestQueueCount -ne $global:PowerAugerCurrentQueueCount) {
+            $global:PowerAugerCurrentCat = Get-PowerAugerCat -QueueCount $latestQueueCount
+            $global:PowerAugerCurrentQueueCount = $latestQueueCount
+        }
+    } catch {
+        # Log but don't disrupt
+        Write-Debug "PowerAuger channel read error: $_"
+    }
+}
+
+# Function to restore original prompt
+function Reset-PowerAugerPrompt {
+    if ($global:PowerAugerOriginalPrompt) {
+        Set-Content function:prompt -Value $global:PowerAugerOriginalPrompt
+        Remove-Variable -Name PowerAugerOriginalPrompt -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name PowerAugerCurrentCat -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name PowerAugerCurrentQueueCount -Scope Global -ErrorAction SilentlyContinue
+        Write-Host "Original prompt restored." -ForegroundColor Yellow
+    }
+}
+
+# Function to manually populate history for testing
+function Add-PowerAugerHistory {
+    param(
+        [string[]]$Commands
+    )
+
+    $predictors = [System.Management.Automation.Subsystem.SubsystemManager]::GetAllSubsystemInfo() |
+        Where-Object { $_.Kind -eq 'CommandPredictor' }
+
+    $ourPredictor = $null
+    if ($predictors -and $predictors.Implementations) {
+        $ourPredictor = $predictors.Implementations |
+            Where-Object { $_.Id -eq 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' }
+    }
+
+    if ($ourPredictor) {
+        foreach ($cmd in $Commands) {
+            Write-Host "  Adding: $cmd" -ForegroundColor Gray
+            $ourPredictor.OnCommandLineAccepted($cmd)
+        }
+        Write-Host "Added $($Commands.Count) commands to contextual history" -ForegroundColor Green
+    } else {
+        Write-Warning "PowerAuger predictor not found"
+    }
+}
+
+# Export a status function for debugging
+function Get-PowerAugerStatus {
+    Write-Host "PowerAuger Predictor Status:" -ForegroundColor Cyan
+    Write-Host "  Contextual history: $([PowerAugerPredictor]::ContextualHistory.Count)" -ForegroundColor Green
+    Write-Host "  Response Cache (thread-safe): $([PowerAugerPredictor]::ResponseCache.Count)" -ForegroundColor Green
+    Write-Host "  Model: $([PowerAugerPredictor]::Model)"
+    Write-Host "  Background engine: $(if ([PowerAugerPredictor]::IsBackgroundRunning) { '✅ Running' } else { '❌ Stopped' })" -ForegroundColor $(if ([PowerAugerPredictor]::IsBackgroundRunning) { 'Green' } else { 'Red' })
+
+    # Show queue status with gradient cat health indicator
+    $queueCount = 0
+    try {
+        $queueCount = [PowerAugerPredictor]::MessageQueue.Count
+    } catch {}
+
+    # Queue health status
+    $queueStatus = switch ($queueCount) {
+        {$_ -eq 0}    { @{ Color = "Green"; Desc = "idle" } }
+        {$_ -le 5}    { @{ Color = "DarkGreen"; Desc = "light" } }
+        {$_ -le 10}   { @{ Color = "Cyan"; Desc = "moderate" } }
+        {$_ -le 20}   { @{ Color = "Yellow"; Desc = "busy" } }
+        {$_ -le 30}   { @{ Color = "DarkYellow"; Desc = "heavy" } }
+        {$_ -le 45}   { @{ Color = "Magenta"; Desc = "overloaded" } }
+        default       { @{ Color = "Red"; Desc = "critical" } }
+    }
+
+    Write-Host "  Queue: $queueCount ($($queueStatus.Desc))" -ForegroundColor $queueStatus.Color
+
+    # Show contextual learning stats
+    if ([PowerAugerPredictor]::ContextualHistory.Count -gt 0) {
+        Write-Host "`n  Contextual Learning:" -ForegroundColor Magenta
+
+        # Extract unique directories from keys
+        $directories = [PowerAugerPredictor]::ContextualHistory.Keys |
+            ForEach-Object { ($_ -split '\|')[1] } |
+            Select-Object -Unique |
+            Where-Object { $_ -ne '*' }
+        Write-Host "    Directories tracked: $($directories.Count + 1)" # +1 for wildcard
+
+        # Show top accepted commands from hashtable values
+        $topCommands = [PowerAugerPredictor]::ContextualHistory.Values |
+            Sort-Object -Property AcceptedCount -Descending |
+            Select-Object -First 3
+
+        Write-Host "    Top accepted predictions:" -ForegroundColor Yellow
+        foreach ($cmd in $topCommands) {
+            $shortCmd = if ($cmd.FullCommand.Length -gt 40) {
+                $cmd.FullCommand.Substring(0, 40) + "..."
+            } else {
+                $cmd.FullCommand
+            }
+            Write-Host "      [$($cmd.AcceptedCount)x] $shortCmd (in $($cmd.Context.DirName))"
+        }
+    }
+
+    # DON'T show cache samples - they're not real predictions
+    # Just check Ollama connection
+    try {
+        $test = Invoke-RestMethod -Uri "$([PowerAugerPredictor]::ApiUrl)/api/tags" -TimeoutSec 1
+        Write-Host "`n  Ollama: ✅ Connected" -ForegroundColor Green
+    } catch {
+        Write-Host "`n  Ollama: ❌ Not responding" -ForegroundColor Red
+    }
+}
+
+# Cleanup function for module unload
+function Stop-PowerAugerBackground {
+    if ([PowerAugerPredictor]::IsBackgroundRunning) {
+        try {
+            if ([PowerAugerPredictor]::PredictionPowerShell) {
+                [PowerAugerPredictor]::PredictionPowerShell.Stop()
+                [PowerAugerPredictor]::PredictionPowerShell.Dispose()
+            }
+            if ([PowerAugerPredictor]::PredictionRunspace) {
+                [PowerAugerPredictor]::PredictionRunspace.Close()
+                [PowerAugerPredictor]::PredictionRunspace.Dispose()
+            }
+            [PowerAugerPredictor]::IsBackgroundRunning = $false
+            Write-Host "PowerAuger background engine stopped." -ForegroundColor Yellow
+        } catch {
+            Write-Warning "Error stopping PowerAuger background: $_"
         }
     }
 }
 
-# Model Registry for easy expansion
-$global:ModelRegistry = @{
-    'FastCompletion' = $global:OllamaConfig.Models.FastCompletion
-    'ContextAware'   = $global:OllamaConfig.Models.ContextAware
-    'Ranker'         = $global:OllamaConfig.Models.Ranker
-    # Future models: Python, JavaScript, JSON-specific, etc.
+# Check if already registered and only create new instance if not
+try {
+    $existingPredictors = [System.Management.Automation.Subsystem.SubsystemManager]::GetSubsystems([System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor)
+    $ourPredictor = $existingPredictors | Where-Object { $_.Id -eq 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' }
+
+    if ($ourPredictor) {
+        Write-Host "PowerAuger predictor already registered." -ForegroundColor Yellow
+        # Restart background if needed
+        if (-not [PowerAugerPredictor]::IsBackgroundRunning) {
+            Write-Host "Restarting background prediction engine..." -ForegroundColor Cyan
+            $dummy = [PowerAugerPredictor]::new()  # This will restart the background
+        }
+    } else {
+        # Not registered yet, create and register
+        $predictorInstance = [PowerAugerPredictor]::new()
+        [System.Management.Automation.Subsystem.SubsystemManager]::RegisterSubsystem(
+            [System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor,
+            $predictorInstance
+        )
+        Write-Host "PowerAuger predictor registered successfully." -ForegroundColor Green
+    }
+
+    # Event systems removed - no auto-refresh
+
+} catch {
+    # First time registration
+    try {
+        $predictorInstance = [PowerAugerPredictor]::new()
+        [System.Management.Automation.Subsystem.SubsystemManager]::RegisterSubsystem(
+            [System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor,
+            $predictorInstance
+        )
+        Write-Host "PowerAuger predictor registered successfully." -ForegroundColor Green
+
+        # Event systems removed - no auto-refresh
+
+    } catch {
+        Write-Warning "Failed to register PowerAuger predictor: $_"
+    }
 }
 
+# Register cleanup on module removal
+$ExecutionContext.SessionState.Module.OnRemove = {
+    # Signal cancellation FIRST to stop background work
+    if ([PowerAugerPredictor]::CancellationSource) {
+        [PowerAugerPredictor]::CancellationSource.Cancel()
+    }
 
-# --------------------------------------------------------------------------------------------------------
-# MODULE EXPORTS
-# --------------------------------------------------------------------------------------------------------
+    # No timers to stop - using event-driven channel updates
 
-# Main prediction function for PSReadLine
-Export-ModuleMember -Function Get-CommandPrediction
+    # Complete the message queue to stop accepting new work
+    if ([PowerAugerPredictor]::MessageQueue) {
+        [PowerAugerPredictor]::MessageQueue.CompleteAdding()
+    }
 
-# Management functions
-Export-ModuleMember -Function @(
-    'Initialize-OllamaPredictor',
-    'Set-PredictorConfiguration',
-    'Start-OllamaTunnel',
-    'Stop-OllamaTunnel',
-    'Test-OllamaConnection',
-    'Show-PredictorStatus',
-    'Get-PredictorStatistics',
-    'Get-PredictionLog', # NEW
-    'Save-PowerAugerState',
-    'Clear-PowerAugerCache' # NEW
-)
+    # Wait for background to acknowledge shutdown with mutex
+    $acquired = $false
+    try {
+        if ([PowerAugerPredictor]::ShutdownMutex) {
+            $acquired = [PowerAugerPredictor]::ShutdownMutex.WaitOne(5000)
+        }
 
-# Auto-initialize if not in module development mode and not already initialized
-if (-not $env:OLLAMA_PREDICTOR_DEV_MODE -and -not $global:PowerAugerInitialized) {
-    Initialize-OllamaPredictor
-    $global:PowerAugerInitialized = $true
+        if ($acquired) {
+            # NOW safe to save contextual history after background has stopped
+            try {
+                $historyPath = [PowerAugerPredictor]::ContextualHistoryPath
+                $historyDir = Split-Path -Path $historyPath -Parent
+                if (-not (Test-Path $historyDir)) {
+                    New-Item -ItemType Directory -Path $historyDir -Force | Out-Null
+                }
+
+                # Save contextual history
+                $historyData = @{}
+                foreach ($key in [PowerAugerPredictor]::ContextualHistory.Keys) {
+                    $historyData[$key] = [PowerAugerPredictor]::ContextualHistory[$key]
+                }
+
+                if ($historyData.Count -gt 0) {
+                    $historyData | ConvertTo-Json -Depth 4 | Set-Content -Path $historyPath -Force
+                    Write-Host "PowerAuger: Saved $($historyData.Count) contextual history entries" -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Failed to save PowerAuger contextual history on exit: $_"
+            }
+        }
+    } finally {
+        if ($acquired -and [PowerAugerPredictor]::ShutdownMutex) {
+            [PowerAugerPredictor]::ShutdownMutex.ReleaseMutex()
+        }
+    }
+
+    # Clean shutdown of runspace and PowerShell
+    if ([PowerAugerPredictor]::PredictionPowerShell) {
+        try { [PowerAugerPredictor]::PredictionPowerShell.Stop() } catch { }
+        try { [PowerAugerPredictor]::PredictionPowerShell.Dispose() } catch { }
+        [PowerAugerPredictor]::PredictionPowerShell = $null
+    }
+
+    if ([PowerAugerPredictor]::PredictionRunspace) {
+        try { [PowerAugerPredictor]::PredictionRunspace.Close() } catch { }
+        try { [PowerAugerPredictor]::PredictionRunspace.Dispose() } catch { }
+        [PowerAugerPredictor]::PredictionRunspace = $null
+    }
+
+    # Unregister the predictor
+    try {
+        [System.Management.Automation.Subsystem.SubsystemManager]::UnregisterSubsystem(
+            [System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor,
+            [guid]::Parse('a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+        )
+        Write-Host "PowerAuger predictor unregistered." -ForegroundColor Yellow
+    } catch {
+        # Ignore if already unregistered
+    }
+
+    # Clean up static resources
+    if ([PowerAugerPredictor]::MessageQueue) {
+        try { [PowerAugerPredictor]::MessageQueue.Dispose() } catch { }
+    }
+    if ([PowerAugerPredictor]::CancellationSource) {
+        try { [PowerAugerPredictor]::CancellationSource.Dispose() } catch { }
+    }
+    if ([PowerAugerPredictor]::ShutdownMutex) {
+        try { [PowerAugerPredictor]::ShutdownMutex.Dispose() } catch { }
+    }
 }

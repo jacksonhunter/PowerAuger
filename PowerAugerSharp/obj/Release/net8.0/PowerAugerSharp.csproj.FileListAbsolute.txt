@@ -1,0 +1,13 @@
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.csproj.AssemblyReference.cache
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.AssemblyInfoInputs.cache
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.AssemblyInfo.cs
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.csproj.CoreCompileInputs.cache
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.sourcelink.json
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\bin\Release\net8.0\PowerAugerSharp.deps.json
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\bin\Release\net8.0\PowerAugerSharp.dll
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\bin\Release\net8.0\PowerAugerSharp.pdb
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.dll
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\refint\PowerAugerSharp.dll
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\PowerAugerSharp.pdb
+C:\Users\jacks\experiments\VSCodeProjects\PowerAuger\PowerAugerSharp\obj\Release\net8.0\ref\PowerAugerSharp.dll
