@@ -23,6 +23,12 @@ PowerAuger uses AST-based validation to provide high-quality PowerShell command 
 
 All planned features have been successfully implemented as of 2025-10-02.
 
+**Latest Updates (2025-10-02):**
+- ✅ Multiline command support with backtick continuation
+- ✅ Proper handling of ForEach-Object vs foreach statements
+- ✅ CommandExpressionAst support for pure expressions
+- ✅ Validated history loading with deduplication
+
 ## Core Principles
 
 ### 1. Use What PSReadLine Already Parsed
