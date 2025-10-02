@@ -36,112 +36,63 @@ namespace PowerAugerSharp
                 int filteredCount = 0;
                 int duplicateCount = 0;
                 int parseErrorCount = 0;
+                int multilineCount = 0;
 
-                foreach (var line in lines)
+                // Handle multiline commands with backtick continuation
+                var currentCommand = new System.Text.StringBuilder();
+
+                for (int i = 0; i < lines.Length; i++)
                 {
-                    // Skip empty lines
-                    if (string.IsNullOrWhiteSpace(line))
-                        continue;
+                    var line = lines[i];
 
-                    // Skip duplicates
-                    if (uniqueCommands.Contains(line))
+                    // Skip empty lines and comments
+                    if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#"))
                     {
-                        duplicateCount++;
-                        continue;
-                    }
-
-                    // Parse the line to get AST
-                    var ast = Parser.ParseInput(line, out _, out var errors);
-
-                    if (errors.Length > 0)
-                    {
-                        parseErrorCount++;
-                        logger?.LogDebug($"Skip history with parse errors: {line}");
-                        continue;
-                    }
-
-                    var firstStatement = ast?.EndBlock?.Statements?.FirstOrDefault();
-                    if (firstStatement == null)
-                    {
-                        logger?.LogDebug($"Skip history with no statements: {line}");
-                        continue;
-                    }
-
-                    // Filter assignments
-                    if (firstStatement is AssignmentStatementAst)
-                    {
-                        filteredCount++;
-                        logger?.LogDebug($"Skip assignment in history: {line}");
-                        continue;
-                    }
-
-                    // Filter if-statements
-                    if (firstStatement is IfStatementAst)
-                    {
-                        filteredCount++;
-                        logger?.LogDebug($"Skip if-statement in history: {line}");
-                        continue;
-                    }
-
-                    // Filter while/for/foreach loops
-                    if (firstStatement is LoopStatementAst)
-                    {
-                        filteredCount++;
-                        logger?.LogDebug($"Skip loop statement in history: {line}");
-                        continue;
-                    }
-
-                    // Filter try-catch blocks
-                    if (firstStatement is TryStatementAst)
-                    {
-                        filteredCount++;
-                        logger?.LogDebug($"Skip try-catch in history: {line}");
-                        continue;
-                    }
-
-                    // For pipeline commands, validate each command exists
-                    if (firstStatement is PipelineAst pipeline)
-                    {
-                        bool skipPipeline = false;
-
-                        foreach (var element in pipeline.PipelineElements)
+                        // If we have a command built up, process it
+                        if (currentCommand.Length > 0)
                         {
-                            if (element is CommandAst cmd)
-                            {
-                                var cmdName = cmd.GetCommandName();
-
-                                // Skip very short command names (likely typos)
-                                if (string.IsNullOrWhiteSpace(cmdName) || cmdName.Length < 2)
-                                {
-                                    skipPipeline = true;
-                                    logger?.LogDebug($"Skip short command in history: {cmdName}");
-                                    break;
-                                }
-
-                                // Skip commands that look like file paths
-                                if (cmdName.Contains('/') || cmdName.Contains('\\'))
-                                {
-                                    skipPipeline = true;
-                                    logger?.LogDebug($"Skip path-like command in history: {cmdName}");
-                                    break;
-                                }
-                            }
+                            var fullCommand = currentCommand.ToString().Trim();
+                            ProcessCommand(fullCommand, uniqueCommands, validated,
+                                ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
+                            currentCommand.Clear();
                         }
-
-                        if (skipPipeline)
-                        {
-                            filteredCount++;
-                            continue;
-                        }
+                        continue;
                     }
 
-                    // Passed all validation
-                    validated.Add(line);
-                    uniqueCommands.Add(line);
+                    // Check if this is a continuation line (ends with backtick)
+                    if (line.EndsWith("`"))
+                    {
+                        // Remove the backtick and add to current command
+                        currentCommand.AppendLine(line.Substring(0, line.Length - 1));
+                        multilineCount++;
+                    }
+                    else if (currentCommand.Length > 0)
+                    {
+                        // This is the last line of a multiline command
+                        currentCommand.AppendLine(line);
+                        var fullCommand = currentCommand.ToString().Trim();
+                        ProcessCommand(fullCommand, uniqueCommands, validated,
+                            ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
+                        currentCommand.Clear();
+                    }
+                    else
+                    {
+                        // Single line command
+                        ProcessCommand(line, uniqueCommands, validated,
+                            ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
+                    }
+                }
+
+                // Don't forget the last command if it exists
+                if (currentCommand.Length > 0)
+                {
+                    var fullCommand = currentCommand.ToString().Trim();
+                    ProcessCommand(fullCommand, uniqueCommands, validated,
+                        ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
                 }
 
                 logger?.LogInfo($"Loaded {validated.Count} validated commands from history");
-                logger?.LogInfo($"Filtered: {filteredCount}, Duplicates: {duplicateCount}, Parse errors: {parseErrorCount}");
+                logger?.LogInfo($"Filtered: {filteredCount}, Duplicates: {duplicateCount}, Parse errors: {parseErrorCount}, Multiline: {multilineCount}");
             }
             catch (Exception ex)
             {
@@ -149,6 +100,119 @@ namespace PowerAugerSharp
             }
 
             return validated;
+        }
+
+        /// <summary>
+        /// Process a single command for validation and adding to the collection
+        /// </summary>
+        private static void ProcessCommand(
+            string command,
+            HashSet<string> uniqueCommands,
+            List<string> validated,
+            ref int filteredCount,
+            ref int duplicateCount,
+            ref int parseErrorCount,
+            FastLogger? logger)
+        {
+            // Skip empty
+            if (string.IsNullOrWhiteSpace(command))
+                return;
+
+            // Skip duplicates
+            if (uniqueCommands.Contains(command))
+            {
+                duplicateCount++;
+                return;
+            }
+
+            // Parse the command to get AST
+            var ast = Parser.ParseInput(command, out _, out var errors);
+
+            if (errors.Length > 0)
+            {
+                parseErrorCount++;
+                logger?.LogDebug($"Skip history with parse errors: {command}");
+                return;
+            }
+
+            var firstStatement = ast?.EndBlock?.Statements?.FirstOrDefault();
+            if (firstStatement == null)
+            {
+                logger?.LogDebug($"Skip history with no statements: {command}");
+                return;
+            }
+
+            // Filter assignments
+            if (firstStatement is AssignmentStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip assignment in history: {command}");
+                return;
+            }
+
+            // Filter if-statements
+            if (firstStatement is IfStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip if-statement in history: {command}");
+                return;
+            }
+
+            // Filter while/for/foreach loops
+            if (firstStatement is LoopStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip loop statement in history: {command}");
+                return;
+            }
+
+            // Filter try-catch blocks
+            if (firstStatement is TryStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip try-catch in history: {command}");
+                return;
+            }
+
+            // For pipeline commands, validate each command exists
+            if (firstStatement is PipelineAst pipeline)
+            {
+                bool skipPipeline = false;
+
+                foreach (var element in pipeline.PipelineElements)
+                {
+                    if (element is CommandAst cmd)
+                    {
+                        var cmdName = cmd.GetCommandName();
+
+                        // Skip very short command names (likely typos)
+                        if (string.IsNullOrWhiteSpace(cmdName) || cmdName.Length < 2)
+                        {
+                            skipPipeline = true;
+                            logger?.LogDebug($"Skip short command in history: {cmdName}");
+                            break;
+                        }
+
+                        // Skip commands that look like file paths
+                        if (cmdName.Contains('/') || cmdName.Contains('\\'))
+                        {
+                            skipPipeline = true;
+                            logger?.LogDebug($"Skip path-like command in history: {cmdName}");
+                            break;
+                        }
+                    }
+                }
+
+                if (skipPipeline)
+                {
+                    filteredCount++;
+                    return;
+                }
+            }
+
+            // Passed all validation
+            validated.Add(command);
+            uniqueCommands.Add(command);
         }
 
         /// <summary>

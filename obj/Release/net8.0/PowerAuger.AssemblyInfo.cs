@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PowerAuger")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+24751a3f7103d92d334adbc1fcb2fc6299eb95b7")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e8fa5c6e112a6a0c05b068409a097e9d80388a93")]
 [assembly: System.Reflection.AssemblyProductAttribute("PowerAuger")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PowerAuger")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
