@@ -1,0 +1,13 @@
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\bin\Release\net8.0\PowerAuger.deps.json
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\bin\Release\net8.0\PowerAuger.dll
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\bin\Release\net8.0\PowerAuger.pdb
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.csproj.AssemblyReference.cache
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.AssemblyInfoInputs.cache
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.AssemblyInfo.cs
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.csproj.CoreCompileInputs.cache
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.dll
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\refint\PowerAuger.dll
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.pdb
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\ref\PowerAuger.dll
+C:\Users\jacks\experiments\RiderProjects\PowerAuger\obj\Release\net8.0\PowerAuger.sourcelink.json
