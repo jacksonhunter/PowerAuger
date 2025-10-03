@@ -58,10 +58,9 @@ Successfully implemented the complete AST-based validation architecture for Powe
 ## Architecture Highlights
 
 ### Multi-Layer Cache System
-1. **Prediction Cache** (3s TTL) - Recent predictions
-2. **Hot Cache** (200 prefixes) - Frequently accessed
-3. **CompletionPromiseCache** (AST-based) - Validated completions
-4. **CompletionTrie** - All validated history
+1. **FrecencyStore** - Primary storage with zsh-z scoring algorithm
+2. **CompletionPromiseCache** (AST-based) - Validated completions with async enrichment
+3. **Ollama Integration** - AI-powered suggestions when available
 
 ### Thread-Safe Design
 - Channel<PowerShell> pool with 4 instances

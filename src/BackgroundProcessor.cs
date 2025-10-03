@@ -6,7 +6,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     /// <summary>
     /// Manages a pool of PowerShell instances for async command completion

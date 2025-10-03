@@ -6,7 +6,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     public sealed class FastLogger : IDisposable
     {
@@ -31,7 +31,7 @@ namespace PowerAugerSharp
         {
             _logDirectory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PowerAugerSharp",
+                "PowerAuger",
                 "logs");
             Directory.CreateDirectory(_logDirectory);
 

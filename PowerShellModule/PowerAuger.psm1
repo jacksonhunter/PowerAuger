@@ -1,21 +1,21 @@
-# PowerAugerSharp.psm1 - PowerShell module wrapper for AST-based C# predictor
+# PowerAuger.psm1 - PowerShell module wrapper for AST-based C# predictor
 
 using namespace System.Management.Automation.Subsystem
 
 # Load the C# assembly
-$assemblyPath = Join-Path $PSScriptRoot "bin\PowerAugerSharp.dll"
+$assemblyPath = Join-Path $PSScriptRoot "bin\PowerAuger.dll"
 if (Test-Path $assemblyPath) {
     try {
         Add-Type -Path $assemblyPath
-        Write-Verbose "PowerAugerSharp assembly loaded from: $assemblyPath"
+        Write-Verbose "PowerAuger assembly loaded from: $assemblyPath"
     }
     catch {
-        Write-Error "Failed to load PowerAugerSharp assembly: $_"
+        Write-Error "Failed to load PowerAuger assembly: $_"
         return
     }
 }
 else {
-    Write-Error "PowerAugerSharp.dll not found at: $assemblyPath"
+    Write-Error "PowerAuger.dll not found at: $assemblyPath"
     Write-Host "Please build the project first with: dotnet build" -ForegroundColor Yellow
     return
 }
@@ -24,30 +24,30 @@ else {
 $script:PredictorInstance = $null
 $script:IsEnabled = $false
 
-function Enable-PowerAugerSharp {
+function Enable-PowerAuger {
     <#
     .SYNOPSIS
-    Enables the PowerAugerSharp predictor for PSReadLine
+    Enables the PowerAuger predictor for PSReadLine
 
     .DESCRIPTION
-    Registers the PowerAugerSharp predictor with the PowerShell subsystem manager
+    Registers the PowerAuger predictor with the PowerShell subsystem manager
     and configures PSReadLine to use it for AI-powered command completions.
 
     .EXAMPLE
-    Enable-PowerAugerSharp
+    Enable-PowerAuger
     #>
     [CmdletBinding()]
     param()
 
     if ($script:IsEnabled) {
-        Write-Host "PowerAugerSharp is already enabled" -ForegroundColor Yellow
+        Write-Host "PowerAuger is already enabled" -ForegroundColor Yellow
 
         # Check if it's actually registered
         $registered = [System.Management.Automation.Subsystem.SubsystemManager]::GetSubsystems([System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor) |
             Where-Object { $_.Id -eq $script:PredictorInstance.Id }
 
         if (-not $registered) {
-            Write-Host "PowerAugerSharp was marked as enabled but not registered. Re-registering..." -ForegroundColor Yellow
+            Write-Host "PowerAuger was marked as enabled but not registered. Re-registering..." -ForegroundColor Yellow
             $script:IsEnabled = $false
         }
         else {
@@ -59,7 +59,7 @@ function Enable-PowerAugerSharp {
         # Get or create the predictor instance
         if ($null -eq $script:PredictorInstance) {
             Write-Verbose "Creating new PowerAugerPredictor instance..."
-            $script:PredictorInstance = [PowerAugerSharp.PowerAugerPredictor]::Instance
+            $script:PredictorInstance = [PowerAuger.PowerAugerPredictor]::Instance
             Write-Verbose "Instance created with ID: $($script:PredictorInstance.Id)"
         }
 
@@ -68,7 +68,7 @@ function Enable-PowerAugerSharp {
             Where-Object { $_.Id -eq $script:PredictorInstance.Id }
 
         if ($existing) {
-            Write-Host "PowerAugerSharp predictor is already registered" -ForegroundColor Yellow
+            Write-Host "PowerAuger predictor is already registered" -ForegroundColor Yellow
             $script:IsEnabled = $true
             return
         }
@@ -85,33 +85,33 @@ function Enable-PowerAugerSharp {
         Set-PSReadLineOption -PredictionViewStyle ListView
 
         $script:IsEnabled = $true
-        Write-Host "PowerAugerSharp predictor enabled successfully!" -ForegroundColor Green
+        Write-Host "PowerAuger predictor enabled successfully!" -ForegroundColor Green
         Write-Host "Predictor ID: $($script:PredictorInstance.Id)" -ForegroundColor DarkGray
         Write-Host "Start typing commands to see AI-powered suggestions (F2 to toggle view)" -ForegroundColor Cyan
     }
     catch {
-        Write-Error "Failed to enable PowerAugerSharp: $_"
+        Write-Error "Failed to enable PowerAuger: $_"
         Write-Host "Stack Trace: $($_.ScriptStackTrace)" -ForegroundColor Red
     }
 }
 
-function Disable-PowerAugerSharp {
+function Disable-PowerAuger {
     <#
     .SYNOPSIS
-    Disables the PowerAugerSharp predictor
+    Disables the PowerAuger predictor
 
     .DESCRIPTION
-    Unregisters the PowerAugerSharp predictor from the PowerShell subsystem manager
+    Unregisters the PowerAuger predictor from the PowerShell subsystem manager
     and cleans up resources.
 
     .EXAMPLE
-    Disable-PowerAugerSharp
+    Disable-PowerAuger
     #>
     [CmdletBinding()]
     param()
 
     if (-not $script:IsEnabled) {
-        Write-Host "PowerAugerSharp is not currently enabled" -ForegroundColor Yellow
+        Write-Host "PowerAuger is not currently enabled" -ForegroundColor Yellow
         return
     }
 
@@ -134,24 +134,24 @@ function Disable-PowerAugerSharp {
         Set-PSReadLineOption -PredictionSource History
 
         $script:IsEnabled = $false
-        Write-Host "PowerAugerSharp predictor disabled" -ForegroundColor Yellow
+        Write-Host "PowerAuger predictor disabled" -ForegroundColor Yellow
     }
     catch {
-        Write-Error "Failed to disable PowerAugerSharp: $_"
+        Write-Error "Failed to disable PowerAuger: $_"
     }
 }
 
-function Get-PowerAugerSharpStatus {
+function Get-PowerAugerStatus {
     <#
     .SYNOPSIS
-    Gets the status of PowerAugerSharp predictor
+    Gets the status of PowerAuger predictor
 
     .DESCRIPTION
-    Returns information about the PowerAugerSharp predictor including
+    Returns information about the PowerAuger predictor including
     whether it's enabled, cache statistics, and Ollama connectivity.
 
     .EXAMPLE
-    Get-PowerAugerSharpStatus
+    Get-PowerAugerStatus
     #>
     [CmdletBinding()]
     param()
@@ -176,8 +176,8 @@ function Get-PowerAugerSharpStatus {
     }
 
     # Get log and cache directories
-    $status.LogDirectory = Join-Path $env:LOCALAPPDATA "PowerAugerSharp\logs"
-    $status.CacheDirectory = Join-Path $env:LOCALAPPDATA "PowerAugerSharp"
+    $status.LogDirectory = Join-Path $env:LOCALAPPDATA "PowerAuger\logs"
+    $status.CacheDirectory = Join-Path $env:LOCALAPPDATA "PowerAuger"
 
     # Check if Ollama is running
     try {
@@ -204,7 +204,7 @@ function Get-PowerAugerSharpStatus {
 
 
 # Auto-enable on module import
-Write-Host "PowerAugerSharp: Module loaded. Registering predictor..." -ForegroundColor Cyan
+Write-Host "PowerAuger: Module loaded. Registering predictor..." -ForegroundColor Cyan
 
 # Use a script block to ensure proper initialization timing
 $registerPredictor = {
@@ -213,22 +213,22 @@ $registerPredictor = {
         Start-Sleep -Milliseconds 100
 
         # Check if we can access the C# class
-        if (-not ([System.Management.Automation.PSTypeName]'PowerAugerSharp.PowerAugerPredictor').Type) {
-            Write-Warning "PowerAugerSharp assembly not yet loaded. Run Enable-PowerAugerSharp manually."
+        if (-not ([System.Management.Automation.PSTypeName]'PowerAuger.PowerAugerPredictor').Type) {
+            Write-Warning "PowerAuger assembly not yet loaded. Run Enable-PowerAuger manually."
             return
         }
 
         # Try to get the singleton instance
         $instance = $null
         try {
-            $instance = [PowerAugerSharp.PowerAugerPredictor]::Instance
+            $instance = [PowerAuger.PowerAugerPredictor]::Instance
         }
         catch {
             Write-Verbose "Could not get PowerAugerPredictor instance: $_"
         }
 
         if ($null -eq $instance) {
-            Write-Host "PowerAugerSharp: Predictor not ready. Run Enable-PowerAugerSharp when ready to use." -ForegroundColor Yellow
+            Write-Host "PowerAuger: Predictor not ready. Run Enable-PowerAuger when ready to use." -ForegroundColor Yellow
             return
         }
 
@@ -246,13 +246,13 @@ $registerPredictor = {
         Set-PSReadLineOption -PredictionViewStyle ListView -ErrorAction SilentlyContinue
 
         $script:IsEnabled = $true
-        Write-Host "PowerAugerSharp: [OK] Predictor registered successfully!" -ForegroundColor Green
-        Write-Host "PowerAugerSharp: Start typing to see AI-powered suggestions (F2 to toggle view)" -ForegroundColor Cyan
-        Write-Host "PowerAugerSharp: Predictor ID: $($script:PredictorInstance.Id)" -ForegroundColor DarkGray
+        Write-Host "PowerAuger: [OK] Predictor registered successfully!" -ForegroundColor Green
+        Write-Host "PowerAuger: Start typing to see AI-powered suggestions (F2 to toggle view)" -ForegroundColor Cyan
+        Write-Host "PowerAuger: Predictor ID: $($script:PredictorInstance.Id)" -ForegroundColor DarkGray
     }
     catch {
-        Write-Host "PowerAugerSharp: Auto-registration failed. Error: $_" -ForegroundColor Yellow
-        Write-Host "PowerAugerSharp: Run 'Enable-PowerAugerSharp' manually to register the predictor." -ForegroundColor Yellow
+        Write-Host "PowerAuger: Auto-registration failed. Error: $_" -ForegroundColor Yellow
+        Write-Host "PowerAuger: Run 'Enable-PowerAuger' manually to register the predictor." -ForegroundColor Yellow
     }
 }
 
@@ -268,11 +268,11 @@ else {
 
 # Register cleanup on module removal
 $MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
-    Write-Host "PowerAugerSharp: Cleaning up..." -ForegroundColor Yellow
-    Disable-PowerAugerSharp
+    Write-Host "PowerAuger: Cleaning up..." -ForegroundColor Yellow
+    Disable-PowerAuger
 }
 
 # Display helpful information
-Write-Host "PowerAugerSharp: Cache location: $env:LOCALAPPDATA\PowerAugerSharp" -ForegroundColor DarkGray
-Write-Host "PowerAugerSharp: Log location: $env:LOCALAPPDATA\PowerAugerSharp\logs" -ForegroundColor DarkGray
-Write-Host "PowerAugerSharp: Architecture: AST-based with PowerShell pool" -ForegroundColor DarkGray
+Write-Host "PowerAuger: Cache location: $env:LOCALAPPDATA\PowerAuger" -ForegroundColor DarkGray
+Write-Host "PowerAuger: Log location: $env:LOCALAPPDATA\PowerAuger\logs" -ForegroundColor DarkGray
+Write-Host "PowerAuger: Architecture: AST-based with PowerShell pool" -ForegroundColor DarkGray

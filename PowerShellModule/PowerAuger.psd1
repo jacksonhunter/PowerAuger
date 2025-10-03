@@ -1,5 +1,5 @@
 @{
-    RootModule = 'PowerAugerSharp.psm1'
+    RootModule = 'PowerAuger.psm1'
     ModuleVersion = '2.0.0'
     GUID = 'b8c9d0e1-f2a3-4b5c-d6e7-f8a9b0c1d2e3'
     Author = 'PowerAuger Team'
@@ -10,17 +10,15 @@
 
     # Files to include
     FileList = @(
-        'PowerAugerSharp.psm1',
-        'bin\PowerAugerSharp.dll'
+        'PowerAuger.psm1',
+        'bin\PowerAuger.dll'
     )
 
     # Functions to export
     FunctionsToExport = @(
-        'Enable-PowerAugerSharp',
-        'Disable-PowerAugerSharp',
-        'Get-PowerAugerSharpStatus',
-        'Test-PowerAugerSharpRegistration',
-        'Get-PowerAugerSharpMetrics'
+        'Enable-PowerAuger',
+        'Disable-PowerAuger',
+        'Get-PowerAugerStatus'
     )
 
     # Cmdlets to export
@@ -50,7 +48,7 @@ Version 2.0.0 - AST-Based Architecture
             RequireLicenseAcceptance = $false
 
             # Register as predictor subsystem
-            SubsystemsToRegister = @('PowerAugerSharp.PowerAugerPredictor')
+            SubsystemsToRegister = @('PowerAuger.PowerAugerPredictor')
         }
     }
 }

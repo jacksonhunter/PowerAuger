@@ -11,68 +11,35 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     public sealed class FastCompletionStore : IDisposable
     {
-        // Hot cache for most common prefixes
-        private readonly Dictionary<string, List<string>> _hotCache;
-        private readonly ReaderWriterLockSlim _hotCacheLock;
+        // Use FrecencyStore as our storage backend
+        private readonly FrecencyStore _frecencyStore;
 
-        // Main storage using trie for comprehensive coverage
-        private readonly CompletionTrie _trie;
-
-        // AI prediction cache with TTL
-        private readonly ConcurrentDictionary<string, CachedPrediction> _predictionCache;
-
-        // Command history and patterns
-        private readonly ConcurrentDictionary<string, CommandStats> _commandHistory;
-
-        // Track prefix access frequency for promotion
-        private readonly ConcurrentDictionary<string, int> _prefixAccessCount;
-
-        // Promise cache for AST-based completions
+        // Promise cache for AST-based completions (this validates and enriches)
         private readonly CompletionPromiseCache _promiseCache;
 
-        // File paths for persistence
-        private readonly string _cacheDirectory;
-        private readonly string _historyFile;
-        private readonly string _hotCacheFile;
+        // Ollama service for AI completions
+        private readonly OllamaService _ollamaService;
 
         private readonly FastLogger _logger;
         private readonly BackgroundProcessor _pwshPool;
-        private readonly Timer _persistenceTimer;
-        private int _accessCount;
 
-        public FastCompletionStore(FastLogger logger, BackgroundProcessor pwshPool)
+        public FastCompletionStore(FastLogger logger, BackgroundProcessor pwshPool, FrecencyStore frecencyStore)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _pwshPool = pwshPool ?? throw new ArgumentNullException(nameof(pwshPool));
+            _frecencyStore = frecencyStore ?? throw new ArgumentNullException(nameof(frecencyStore));
 
-            _hotCache = new Dictionary<string, List<string>>(200, StringComparer.OrdinalIgnoreCase);
-            _hotCacheLock = new ReaderWriterLockSlim();
+            // Initialize promise cache with PowerShell pool and FrecencyStore
+            _promiseCache = new CompletionPromiseCache(logger, pwshPool.GetPoolReader(), pwshPool, frecencyStore);
 
-            _trie = new CompletionTrie();
-            _predictionCache = new ConcurrentDictionary<string, CachedPrediction>(StringComparer.OrdinalIgnoreCase);
-            _commandHistory = new ConcurrentDictionary<string, CommandStats>(StringComparer.OrdinalIgnoreCase);
-            _prefixAccessCount = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            // Initialize Ollama service for AI completions
+            _ollamaService = new OllamaService(logger);
 
-            // Initialize promise cache with PowerShell pool
-            _promiseCache = new CompletionPromiseCache(logger, pwshPool.GetPoolReader(), pwshPool);
-
-            _cacheDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PowerAugerSharp");
-            Directory.CreateDirectory(_cacheDirectory);
-
-            _historyFile = Path.Combine(_cacheDirectory, "history.json");
-            _hotCacheFile = Path.Combine(_cacheDirectory, "hotcache.json");
-
-            LoadPersistedData();
-            InitializeCommonCompletions();
-
-            // Persist cache every 60 seconds
-            _persistenceTimer = new Timer(_ => PersistData(), null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+            _logger.LogInfo("FastCompletionStore initialized with FrecencyStore backend");
         }
 
         /// <summary>
@@ -87,53 +54,26 @@ namespace PowerAugerSharp
             if (ast == null)
                 return new List<string>();
 
-            // Use AST text for cache key
-            var cacheKey = $"{ast.Extent.Text}:{cursorPosition.Offset}";
-
-            // Layer 1: Check prediction cache
-            if (_predictionCache.TryGetValue(cacheKey, out var cached) && !cached.IsExpired)
-            {
-                return new List<string> { cached.Prediction };
-            }
-
-            // Layer 2: Check hot cache
-            var prefix = ast.Extent.Text.Substring(0, Math.Min(ast.Extent.Text.Length, cursorPosition.Offset));
-            _hotCacheLock.EnterReadLock();
+            // Get AST-validated completions only
             try
             {
-                if (_hotCache.TryGetValue(prefix, out var hotCompletions))
-                {
-                    return hotCompletions.Take(maxResults).ToList();
-                }
-            }
-            finally
-            {
-                _hotCacheLock.ExitReadLock();
-            }
+                var commandCompletion = await _promiseCache.GetCompletionFromAstAsync(ast, tokens, cursorPosition);
 
-            // Layer 3: Use promise cache for AST-based completion
-            try
-            {
-                var completion = await _promiseCache.GetCompletionFromAstAsync(
-                    ast, tokens, cursorPosition);
-
-                if (completion?.CompletionMatches?.Count > 0)
+                if (commandCompletion?.CompletionMatches != null && commandCompletion.CompletionMatches.Count > 0)
                 {
-                    var results = completion.CompletionMatches
-                        .Take(maxResults)
+                    // Extract validated completion texts
+                    var validatedResults = commandCompletion.CompletionMatches
                         .Select(m => m.CompletionText)
+                        .Take(maxResults)
                         .ToList();
 
-                    // Cache results in trie for future use
-                    foreach (var result in results)
+                    // Add validated results to FrecencyStore with high priority
+                    foreach (var result in validatedResults)
                     {
-                        _trie.AddCompletion(prefix, result, 1.0f);
+                        _frecencyStore.AddCommand(result, 5.0f); // High initial rank for validated completions
                     }
 
-                    // Track access for hot cache promotion
-                    TrackAndPromoteIfFrequent(prefix, results);
-
-                    return results;
+                    return validatedResults;
                 }
             }
             catch (Exception ex)
@@ -141,101 +81,35 @@ namespace PowerAugerSharp
                 _logger.LogWarning($"AST completion failed: {ex.Message}");
             }
 
-            // Layer 4: Try trie lookup
-            var trieCompletions = _trie.GetCompletions(prefix, maxResults);
-            if (trieCompletions.Count > 0)
-            {
-                return trieCompletions;
-            }
-
-            // Layer 5: Return empty list (no fallback patterns for AST mode)
+            // No fallback - only return validated completions
             return new List<string>();
         }
 
         /// <summary>
-        /// Get completions synchronously from cache (for fast path)
+        /// Get completions synchronously from FrecencyStore (fast path)
         /// </summary>
         public List<string> GetCompletions(string prefix, int maxResults = 3)
         {
-            Interlocked.Increment(ref _accessCount);
-
-            // Layer 1: Hot cache
-            _hotCacheLock.EnterReadLock();
-            try
-            {
-                if (_hotCache.TryGetValue(prefix, out var hotCompletions))
-                {
-                    return hotCompletions.Take(maxResults).ToList();
-                }
-            }
-            finally
-            {
-                _hotCacheLock.ExitReadLock();
-            }
-
-            // Layer 2: Check prediction cache
-            if (_predictionCache.TryGetValue(prefix, out var cached) && !cached.IsExpired)
-            {
-                return new List<string> { cached.Prediction };
-            }
-
-            // Layer 3: Trie lookup
-            var trieCompletions = _trie.GetCompletions(prefix, maxResults * 2);
-            if (trieCompletions.Count > 0)
-            {
-                var results = trieCompletions.Take(maxResults).ToList();
-
-                // Promote to hot cache if accessed frequently
-                if (_accessCount % 10 == 0)
-                {
-                    PromoteToHotCache(prefix, results);
-                }
-
-                return results;
-            }
-
-            // No fallback patterns - return empty list
-            return new List<string>();
-        }
-
-        public void CachePrediction(string input, string prediction)
-        {
-            _predictionCache[input] = new CachedPrediction
-            {
-                Prediction = prediction,
-                Timestamp = DateTime.UtcNow
-            };
-
-            // Also add to trie for permanent storage
-            _trie.AddCompletion(input, prediction, 1.0f);
+            // Simply delegate to FrecencyStore
+            return _frecencyStore.GetTopCommands(prefix, maxResults);
         }
 
         public void RecordAcceptance(string commandLine)
         {
-            var key = ExtractCommandName(commandLine);
-            _commandHistory.AddOrUpdate(key,
-                k => new CommandStats { Command = commandLine, AcceptCount = 1, LastUsed = DateTime.UtcNow },
-                (k, v) => { v.AcceptCount++; v.LastUsed = DateTime.UtcNow; return v; });
-
-            // Add to trie with increased weight
-            _trie.AddCompletion(key, commandLine, 2.0f);
+            // Increment rank in FrecencyStore
+            _frecencyStore.IncrementRank(commandLine, 2.0f);
         }
 
         public void RecordExecution(string commandLine)
         {
-            var key = ExtractCommandName(commandLine);
-            _commandHistory.AddOrUpdate(key,
-                k => new CommandStats { Command = commandLine, ExecuteCount = 1, LastUsed = DateTime.UtcNow },
-                (k, v) => { v.ExecuteCount++; v.LastUsed = DateTime.UtcNow; return v; });
+            // Higher rank for executed commands
+            _frecencyStore.IncrementRank(commandLine, 3.0f);
         }
 
         public void RecordSuggestionAcceptance(string suggestion)
         {
-            // Track which suggestions are being accepted
-            var key = ExtractCommandName(suggestion);
-            _commandHistory.AddOrUpdate(key,
-                k => new CommandStats { Command = suggestion, SuggestionAcceptCount = 1, LastUsed = DateTime.UtcNow },
-                (k, v) => { v.SuggestionAcceptCount++; v.LastUsed = DateTime.UtcNow; return v; });
+            // Small boost for accepted suggestions
+            _frecencyStore.IncrementRank(suggestion, 1.0f);
         }
 
         public void AddHistoryItem(string historyLine)
@@ -243,8 +117,8 @@ namespace PowerAugerSharp
             if (string.IsNullOrWhiteSpace(historyLine))
                 return;
 
-            var key = ExtractCommandName(historyLine);
-            _trie.AddCompletion(key, historyLine, 0.5f);
+            // Add to FrecencyStore with base priority
+            _frecencyStore.AddCommand(historyLine, 1.0f);
         }
 
         /// <summary>
@@ -252,99 +126,23 @@ namespace PowerAugerSharp
         /// </summary>
         public List<string> GetFewShotExamples(string input, int maxExamples = 3)
         {
-            var examples = new List<string>();
-
-            // Try to find similar commands in history
+            // Try to find similar commands in history using FrecencyStore
             var prefix = ExtractCommandName(input);
             if (string.IsNullOrEmpty(prefix))
                 prefix = input;
 
-            // Get from command history first
-            var relevantCommands = _commandHistory
-                .Where(kvp => kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(kvp => kvp.Value.GetWeight())
-                .Take(maxExamples)
-                .Select(kvp => kvp.Value.Command);
+            // Get top commands from FrecencyStore based on prefix
+            var examples = _frecencyStore.GetTopCommands(prefix, maxExamples);
 
-            examples.AddRange(relevantCommands);
-
-            // If not enough, get from trie
-            if (examples.Count < maxExamples)
+            // If no matches with prefix, try with just the first word
+            if (examples.Count == 0 && input.Contains(' '))
             {
-                var trieExamples = _trie.GetCompletions(prefix, maxExamples - examples.Count);
-                examples.AddRange(trieExamples);
+                var firstWord = input.Split(' ')[0];
+                examples = _frecencyStore.GetTopCommands(firstWord, maxExamples);
             }
 
-            return examples.Take(maxExamples).ToList();
+            return examples;
         }
-
-        private void InitializeCommonCompletions()
-        {
-            // Pre-populate with common PowerShell commands
-            var commonPrefixes = new Dictionary<string, List<string>>
-            {
-                ["Get-"] = new List<string> { "Get-ChildItem", "Get-Content", "Get-Process", "Get-Service", "Get-Help" },
-                ["Set-"] = new List<string> { "Set-Location", "Set-Content", "Set-Variable", "Set-ExecutionPolicy" },
-                ["New-"] = new List<string> { "New-Item", "New-Object", "New-Variable", "New-PSDrive" },
-                ["Remove-"] = new List<string> { "Remove-Item", "Remove-Variable", "Remove-PSDrive" },
-                ["Test-"] = new List<string> { "Test-Path", "Test-Connection", "Test-NetConnection" },
-                ["Start-"] = new List<string> { "Start-Process", "Start-Service", "Start-Transcript", "Start-Sleep" },
-                ["Stop-"] = new List<string> { "Stop-Process", "Stop-Service", "Stop-Transcript" },
-                ["g"] = new List<string> { "git", "Get-ChildItem", "Get-Content" },
-                ["cd"] = new List<string> { "cd", "cd ..", "cd ~" },
-                ["ls"] = new List<string> { "ls", "ls -la", "ls -Force" }
-            };
-
-            _hotCacheLock.EnterWriteLock();
-            try
-            {
-                foreach (var kvp in commonPrefixes)
-                {
-                    _hotCache[kvp.Key] = kvp.Value;
-
-                    // Also add to trie
-                    foreach (var completion in kvp.Value)
-                    {
-                        _trie.AddCompletion(kvp.Key, completion, 1.5f);
-                    }
-                }
-            }
-            finally
-            {
-                _hotCacheLock.ExitWriteLock();
-            }
-        }
-
-        private void TrackAndPromoteIfFrequent(string prefix, List<string> completions)
-        {
-            var count = _prefixAccessCount.AddOrUpdate(prefix, 1, (k, v) => v + 1);
-
-            // Promote to hot cache after 5 accesses
-            if (count == 5)
-            {
-                PromoteToHotCache(prefix, completions);
-            }
-        }
-
-        private void PromoteToHotCache(string prefix, List<string> completions)
-        {
-            _hotCacheLock.EnterWriteLock();
-            try
-            {
-                if (_hotCache.Count >= 200)
-                {
-                    // Remove least recently used
-                    var toRemove = _hotCache.Keys.First();
-                    _hotCache.Remove(toRemove);
-                }
-                _hotCache[prefix] = completions;
-            }
-            finally
-            {
-                _hotCacheLock.ExitWriteLock();
-            }
-        }
-
 
         private static string ExtractCommandName(string commandLine)
         {
@@ -355,80 +153,10 @@ namespace PowerAugerSharp
             return spaceIndex > 0 ? commandLine.Substring(0, spaceIndex) : commandLine;
         }
 
-        private void LoadPersistedData()
-        {
-            try
-            {
-                if (File.Exists(_historyFile))
-                {
-                    var json = File.ReadAllText(_historyFile);
-                    var history = JsonSerializer.Deserialize<Dictionary<string, CommandStats>>(json);
-                    if (history != null)
-                    {
-                        foreach (var kvp in history)
-                        {
-                            _commandHistory[kvp.Key] = kvp.Value;
-                            _trie.AddCompletion(kvp.Key, kvp.Value.Command, kvp.Value.GetWeight());
-                        }
-                    }
-                }
-
-                if (File.Exists(_hotCacheFile))
-                {
-                    var json = File.ReadAllText(_hotCacheFile);
-                    var hotCache = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json);
-                    if (hotCache != null)
-                    {
-                        _hotCacheLock.EnterWriteLock();
-                        try
-                        {
-                            foreach (var kvp in hotCache.Take(200))
-                            {
-                                _hotCache[kvp.Key] = kvp.Value;
-                            }
-                        }
-                        finally
-                        {
-                            _hotCacheLock.ExitWriteLock();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Failed to load persisted data: {ex.Message}");
-            }
-        }
-
-        private void PersistData()
-        {
-            try
-            {
-                var historyJson = JsonSerializer.Serialize(_commandHistory.ToDictionary(k => k.Key, v => v.Value));
-                File.WriteAllText(_historyFile, historyJson);
-
-                _hotCacheLock.EnterReadLock();
-                try
-                {
-                    var hotCacheJson = JsonSerializer.Serialize(_hotCache);
-                    File.WriteAllText(_hotCacheFile, hotCacheJson);
-                }
-                finally
-                {
-                    _hotCacheLock.ExitReadLock();
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Failed to persist data: {ex.Message}");
-            }
-        }
-
         public void Dispose()
         {
-            _persistenceTimer?.Dispose();
-            PersistData();
-            _hotCacheLock?.Dispose();
+            // Dispose of managed resources
+            _ollamaService?.Dispose();
         }
 
         #region Embedded CompletionPromiseCache
@@ -441,13 +169,15 @@ namespace PowerAugerSharp
             private readonly ConcurrentDictionary<string, AsyncLazy<CommandCompletion?>> _promises;
             private readonly ChannelReader<PowerShell> _pwshPoolReader;
             private readonly BackgroundProcessor _pwshPool;
+            private readonly FrecencyStore _frecencyStore;
             private readonly FastLogger _logger;
 
-            public CompletionPromiseCache(FastLogger logger, ChannelReader<PowerShell> pwshPoolReader, BackgroundProcessor pwshPool)
+            public CompletionPromiseCache(FastLogger logger, ChannelReader<PowerShell> pwshPoolReader, BackgroundProcessor pwshPool, FrecencyStore frecencyStore)
             {
                 _logger = logger;
                 _pwshPoolReader = pwshPoolReader;
                 _pwshPool = pwshPool;
+                _frecencyStore = frecencyStore;
                 _promises = new ConcurrentDictionary<string, AsyncLazy<CommandCompletion?>>();
             }
 
@@ -635,28 +365,5 @@ namespace PowerAugerSharp
         }
 
         #endregion
-
-        private class CachedPrediction
-        {
-            public string Prediction { get; set; } = string.Empty;
-            public DateTime Timestamp { get; set; }
-            public bool IsExpired => (DateTime.UtcNow - Timestamp).TotalSeconds > 3;
-        }
-
-        private class CommandStats
-        {
-            public string Command { get; set; } = string.Empty;
-            public int AcceptCount { get; set; }
-            public int ExecuteCount { get; set; }
-            public int SuggestionAcceptCount { get; set; }
-            public DateTime LastUsed { get; set; }
-
-            public float GetWeight()
-            {
-                var daysSinceUse = (DateTime.UtcNow - LastUsed).TotalDays;
-                var recencyFactor = Math.Max(0.1f, 1.0f - (float)(daysSinceUse / 30));
-                return (AcceptCount * 2 + ExecuteCount * 3 + SuggestionAcceptCount) * recencyFactor;
-            }
-        }
     }
 }

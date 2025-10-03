@@ -1,0 +1,40 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+obj/
+bin/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.cache
+*.log
+
+# NuGet
+*.nupkg
+packages/
+
+# PowerShell Module Development
+*.psd1.bak
+*.psm1.bak
+
+# Example modules for reference only
+ExampleModules/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+~$*

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pwsh:*)"
+      "Bash(pwsh:*)",
+      "Bash(dotnet build)"
     ],
     "deny": [],
     "ask": []

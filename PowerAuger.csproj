@@ -4,10 +4,28 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AssemblyName>PowerAuger</AssemblyName>
+    <RootNamespace>PowerAuger</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Management.Automation" Version="7.4.0" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Exclude example modules from compilation -->
+    <Compile Remove="ExampleModules\**\*.cs" />
+    <None Include="ExampleModules\**\*" />
+  </ItemGroup>
+
+  <!-- Copy output to PowerShellModule\bin directory after build -->
+  <Target Name="CopyToPowerShellModule" AfterTargets="Build">
+    <MakeDir Directories="$(ProjectDir)PowerShellModule\bin" />
+    <Copy SourceFiles="$(OutputPath)PowerAuger.dll"
+          DestinationFolder="$(ProjectDir)PowerShellModule\bin" />
+    <Copy SourceFiles="$(OutputPath)PowerAuger.pdb"
+          DestinationFolder="$(ProjectDir)PowerShellModule\bin"
+          Condition="Exists('$(OutputPath)PowerAuger.pdb')" />
+  </Target>
 
 </Project>

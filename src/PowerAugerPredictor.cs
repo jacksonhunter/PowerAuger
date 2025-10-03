@@ -8,7 +8,7 @@ using System.Management.Automation.Subsystem.Prediction;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     public sealed class PowerAugerPredictor : ICommandPredictor
     {
@@ -18,12 +18,12 @@ namespace PowerAugerSharp
         public static PowerAugerPredictor Instance => _instance.Value;
 
         public Guid Id { get; } = new Guid("a7b2c3d4-e5f6-4789-abcd-ef0123456789");
-        public string Name => "PowerAugerSharp";
+        public string Name => "PowerAuger";
         public string Description => "High-performance AI-powered command predictor with AST-based completions";
 
         private readonly BackgroundProcessor _pwshPool;
+        private readonly FrecencyStore _frecencyStore;
         private readonly FastCompletionStore _completionStore;
-        private readonly SuggestionEngine _suggestionEngine;
         private readonly OllamaService _ollamaService;
         private readonly FastLogger _logger;
         private readonly ConcurrentDictionary<string, Task<List<string>>> _pendingCompletions;
@@ -37,11 +37,13 @@ namespace PowerAugerSharp
             // Create PowerShell pool manager
             _pwshPool = new BackgroundProcessor(_logger, poolSize: 4);
 
-            // Create completion store with promise support
-            _completionStore = new FastCompletionStore(_logger, _pwshPool);
+            // Create frecency store for storage and scoring
+            _logger.LogInfo("Initializing FrecencyStore with Terminal/Transit pattern");
+            _frecencyStore = new FrecencyStore(_logger, _pwshPool);
+            _frecencyStore.Initialize();
 
-            // Create suggestion engine with completion store
-            _suggestionEngine = new SuggestionEngine(_completionStore, _logger);
+            // Create completion store for AST validation and Ollama integration
+            _completionStore = new FastCompletionStore(_logger, _pwshPool, _frecencyStore);
 
             // Create Ollama service for AI completions
             _ollamaService = new OllamaService(_logger);
@@ -51,10 +53,10 @@ namespace PowerAugerSharp
 
             _shutdownTokenSource = new CancellationTokenSource();
 
-            // Load validated history asynchronously
-            InitializeHistoryCache();
+            // History is already loaded by FrecencyStore.Initialize()
+            // No need for duplicate loading
 
-            _logger.LogInfo("PowerAugerSharp initialized with AST-based completions");
+            _logger.LogInfo("PowerAuger initialized with AST-based completions");
         }
 
         public SuggestionPackage GetSuggestion(
@@ -124,7 +126,7 @@ namespace PowerAugerSharp
                 }
 
                 // 4. Start new async AST-based completion if not already pending
-                if (!_pendingCompletions.ContainsKey(asyncKey) && tokens != null && errors.Length == 0)
+                if (!_pendingCompletions.ContainsKey(asyncKey) && tokens != null && errors?.Length == 0)
                 {
                     var completionTask = _completionStore.GetCompletionsFromAstAsync(
                         ast,
@@ -141,15 +143,6 @@ namespace PowerAugerSharp
                     });
                 }
 
-                // 5. Try suggestion engine patterns as fallback
-                var engineSuggestions = _suggestionEngine.GetSuggestions(currentCommand, 3);
-                if (engineSuggestions.Count > 0)
-                {
-                    foreach (var suggestion in engineSuggestions)
-                    {
-                        suggestions.Add(suggestion);
-                    }
-                }
 
                 return new SuggestionPackage(suggestions);
             }
@@ -164,6 +157,8 @@ namespace PowerAugerSharp
         {
             try
             {
+                // Both stores handle this
+                _frecencyStore.IncrementRank(commandLine, 2.0f);
                 _completionStore.RecordAcceptance(commandLine);
             }
             catch (Exception ex)
@@ -176,6 +171,8 @@ namespace PowerAugerSharp
         {
             try
             {
+                // Both stores handle this
+                _frecencyStore.IncrementRank(commandLine, 3.0f);
                 _completionStore.RecordExecution(commandLine);
             }
             catch (Exception ex)
@@ -192,6 +189,8 @@ namespace PowerAugerSharp
         {
             try
             {
+                // Both stores handle this
+                _frecencyStore.IncrementRank(suggestion, 1.0f);
                 _completionStore.RecordSuggestionAcceptance(suggestion);
             }
             catch (Exception ex)
@@ -204,6 +203,8 @@ namespace PowerAugerSharp
         {
             try
             {
+                // Both stores handle history
+                _frecencyStore.IncrementRank(historyLine, 1.0f);
                 _completionStore.AddHistoryItem(historyLine);
             }
             catch (Exception ex)
@@ -236,44 +237,6 @@ namespace PowerAugerSharp
             return input.Substring(commandStart, length).TrimStart();
         }
 
-        /// <summary>
-        /// Initialize the history cache with validated commands
-        /// </summary>
-        private void InitializeHistoryCache()
-        {
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    _logger.LogInfo("Loading validated history...");
-
-                    // Load validated history using the new PowerShellHistoryLoader
-                    var history = PowerShellHistoryLoader.LoadValidatedHistory(_logger);
-
-                    if (history.Count > 0)
-                    {
-                        foreach (var line in history)
-                        {
-                            // Only validate and add to cache if it passes AST validation
-                            if (PowerShellHistoryLoader.IsValidHistoryCommand(line, _logger))
-                            {
-                                _completionStore.AddHistoryItem(line);
-                            }
-                        }
-
-                        _logger.LogInfo($"Loaded {history.Count} validated history commands into cache");
-                    }
-                    else
-                    {
-                        _logger.LogWarning("No validated history commands found");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError($"Failed to initialize history cache: {ex.Message}");
-                }
-            });
-        }
 
         public void Dispose()
         {
@@ -281,6 +244,7 @@ namespace PowerAugerSharp
             _shutdownTokenSource?.Dispose();
             _pendingCompletions?.Clear();
             _pwshPool?.Dispose();
+            _frecencyStore?.Dispose();
             _completionStore?.Dispose();
             _ollamaService?.Dispose();
             _logger?.Dispose();

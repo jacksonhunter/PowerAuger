@@ -5,13 +5,204 @@ using System.Linq;
 using System.Management.Automation;
 using System.Management.Automation.Language;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     /// <summary>
     /// Loads and validates PowerShell command history
     /// </summary>
     public static class PowerShellHistoryLoader
     {
+        /// <summary>
+        /// Load and validate PowerShell command history with frequency counting
+        /// </summary>
+        public static Dictionary<string, int> LoadHistoryWithFrequencies(FastLogger? logger = null)
+        {
+            var commandFrequencies = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                var historyPath = GetHistoryPath();
+
+                if (!File.Exists(historyPath))
+                {
+                    logger?.LogWarning($"History file not found: {historyPath}");
+                    return commandFrequencies;
+                }
+
+                var lines = File.ReadAllLines(historyPath);
+                logger?.LogInfo($"Processing {lines.Length} history entries from {historyPath}");
+
+                int filteredCount = 0;
+                int parseErrorCount = 0;
+                int multilineCount = 0;
+
+                // Handle multiline commands with backtick continuation
+                var currentCommand = new System.Text.StringBuilder();
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    var line = lines[i];
+
+                    // Skip empty lines and comments
+                    if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#"))
+                    {
+                        // If we have a command built up, process it
+                        if (currentCommand.Length > 0)
+                        {
+                            var fullCommand = currentCommand.ToString().Trim();
+                            ProcessCommandForFrequency(fullCommand, commandFrequencies,
+                                ref filteredCount, ref parseErrorCount, logger);
+                            currentCommand.Clear();
+                        }
+                        continue;
+                    }
+
+                    // Check if this is a continuation line (ends with backtick)
+                    if (line.EndsWith("`"))
+                    {
+                        // Remove the backtick and add to current command
+                        currentCommand.AppendLine(line.Substring(0, line.Length - 1));
+                        multilineCount++;
+                    }
+                    else if (currentCommand.Length > 0)
+                    {
+                        // This is the last line of a multiline command
+                        currentCommand.AppendLine(line);
+                        var fullCommand = currentCommand.ToString().Trim();
+                        ProcessCommandForFrequency(fullCommand, commandFrequencies,
+                            ref filteredCount, ref parseErrorCount, logger);
+                        currentCommand.Clear();
+                    }
+                    else
+                    {
+                        // Single line command
+                        ProcessCommandForFrequency(line, commandFrequencies,
+                            ref filteredCount, ref parseErrorCount, logger);
+                    }
+                }
+
+                // Don't forget the last command if it exists
+                if (currentCommand.Length > 0)
+                {
+                    var fullCommand = currentCommand.ToString().Trim();
+                    ProcessCommandForFrequency(fullCommand, commandFrequencies,
+                        ref filteredCount, ref parseErrorCount, logger);
+                }
+
+                logger?.LogInfo($"Processed {commandFrequencies.Count} unique commands from history");
+                logger?.LogInfo($"Total occurrences: {commandFrequencies.Values.Sum()}, Filtered: {filteredCount}, Parse errors: {parseErrorCount}, Multiline: {multilineCount}");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError($"Failed to load history: {ex.Message}");
+            }
+
+            return commandFrequencies;
+        }
+
+        /// <summary>
+        /// Process a single command for frequency counting
+        /// </summary>
+        private static void ProcessCommandForFrequency(
+            string command,
+            Dictionary<string, int> commandFrequencies,
+            ref int filteredCount,
+            ref int parseErrorCount,
+            FastLogger? logger)
+        {
+            // Skip empty
+            if (string.IsNullOrWhiteSpace(command))
+                return;
+
+            // Parse the command to get AST
+            var ast = Parser.ParseInput(command, out _, out var errors);
+
+            if (errors.Length > 0)
+            {
+                parseErrorCount++;
+                logger?.LogDebug($"Skip history with parse errors: {command}");
+                return;
+            }
+
+            var firstStatement = ast?.EndBlock?.Statements?.FirstOrDefault();
+            if (firstStatement == null)
+            {
+                logger?.LogDebug($"Skip history with no statements: {command}");
+                return;
+            }
+
+            // Filter assignments
+            if (firstStatement is AssignmentStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip assignment in history: {command}");
+                return;
+            }
+
+            // Filter if-statements
+            if (firstStatement is IfStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip if-statement in history: {command}");
+                return;
+            }
+
+            // Filter while/for/foreach loops
+            if (firstStatement is LoopStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip loop statement in history: {command}");
+                return;
+            }
+
+            // Filter try-catch blocks
+            if (firstStatement is TryStatementAst)
+            {
+                filteredCount++;
+                logger?.LogDebug($"Skip try-catch in history: {command}");
+                return;
+            }
+
+            // For pipeline commands, validate each command exists
+            if (firstStatement is PipelineAst pipeline)
+            {
+                bool skipPipeline = false;
+
+                foreach (var element in pipeline.PipelineElements)
+                {
+                    if (element is CommandAst cmd)
+                    {
+                        var cmdName = cmd.GetCommandName();
+
+                        // Skip very short command names (likely typos)
+                        if (string.IsNullOrWhiteSpace(cmdName) || cmdName.Length < 2)
+                        {
+                            skipPipeline = true;
+                            logger?.LogDebug($"Skip short command in history: {cmdName}");
+                            break;
+                        }
+
+                        // Skip commands that look like file paths
+                        if (cmdName.Contains('/') || cmdName.Contains('\\'))
+                        {
+                            skipPipeline = true;
+                            logger?.LogDebug($"Skip path-like command in history: {cmdName}");
+                            break;
+                        }
+                    }
+                }
+
+                if (skipPipeline)
+                {
+                    filteredCount++;
+                    return;
+                }
+            }
+
+            // Passed all validation - count frequency
+            commandFrequencies[command] = commandFrequencies.GetValueOrDefault(command) + 1;
+        }
+
         /// <summary>
         /// Load and validate PowerShell command history
         /// </summary>
@@ -215,42 +406,6 @@ namespace PowerAugerSharp
             uniqueCommands.Add(command);
         }
 
-        /// <summary>
-        /// Validate a single command using AST analysis
-        /// </summary>
-        public static bool IsValidHistoryCommand(string command, FastLogger? logger = null)
-        {
-            if (string.IsNullOrWhiteSpace(command))
-                return false;
-
-            try
-            {
-                var ast = Parser.ParseInput(command, out _, out var errors);
-
-                if (errors.Length > 0)
-                    return false;
-
-                var firstStatement = ast?.EndBlock?.Statements?.FirstOrDefault();
-                if (firstStatement == null)
-                    return false;
-
-                // Check for unwanted statement types
-                if (firstStatement is AssignmentStatementAst ||
-                    firstStatement is IfStatementAst ||
-                    firstStatement is LoopStatementAst ||
-                    firstStatement is TryStatementAst)
-                {
-                    return false;
-                }
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                logger?.LogDebug($"Error validating command '{command}': {ex.Message}");
-                return false;
-            }
-        }
 
         /// <summary>
         /// Get the path to the PowerShell history file
@@ -293,20 +448,5 @@ namespace PowerAugerSharp
             return psReadLinePath;
         }
 
-        /// <summary>
-        /// Load a subset of recent validated history
-        /// </summary>
-        public static List<string> LoadRecentValidatedHistory(int maxItems = 100, FastLogger? logger = null)
-        {
-            var allHistory = LoadValidatedHistory(logger);
-
-            // Take the most recent items (history file typically has newest at end)
-            if (allHistory.Count > maxItems)
-            {
-                return allHistory.Skip(allHistory.Count - maxItems).ToList();
-            }
-
-            return allHistory;
-        }
     }
 }

@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 using System.Management.Automation;
 using System.Management.Automation.Language;
 
-namespace PowerAugerSharp
+namespace PowerAuger
 {
     public enum CompletionMode
     {

@@ -1,7 +1,7 @@
 ﻿<component name="ProjectRunConfigurationManager">
   <configuration default="false" name="PowerAuger" type="RunExe" factoryName=".NET Executable">
     <option name="EXE_PATH" value="$PROJECT_DIR$/../../../../../Program Files/PowerShell/7/pwsh.exe" />
-    <option name="PROGRAM_PARAMETERS" value="-NoExit -Command &quot;Import-Module 'C:\Users\jacks\experiments\RiderProjects\PowerAuger\PowerShellModule\PowerAugerSharp.psd1'; Write-Host 'PowerAugerSharp loaded!' -ForegroundColor Green" />
+    <option name="PROGRAM_PARAMETERS" value="-NoExit -Command &quot;Import-Module 'C:\Users\jacks\experiments\RiderProjects\PowerAuger\PowerShellModule\PowerAuger.psd1'; Write-Host 'PowerAuger loaded!' -ForegroundColor Green" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/" />
     <option name="PASS_PARENT_ENVS" value="1" />
     <option name="USE_EXTERNAL_CONSOLE" value="0" />
