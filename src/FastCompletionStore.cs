@@ -26,18 +26,20 @@ namespace PowerAuger
 
         private readonly FastLogger _logger;
         private readonly BackgroundProcessor _pwshPool;
+        private readonly CommandHistoryStore _commandHistory;
 
-        public FastCompletionStore(FastLogger logger, BackgroundProcessor pwshPool, FrecencyStore frecencyStore)
+        public FastCompletionStore(FastLogger logger, BackgroundProcessor pwshPool, FrecencyStore frecencyStore, CommandHistoryStore commandHistory)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _pwshPool = pwshPool ?? throw new ArgumentNullException(nameof(pwshPool));
             _frecencyStore = frecencyStore ?? throw new ArgumentNullException(nameof(frecencyStore));
-
-            // Initialize promise cache with PowerShell pool and FrecencyStore
-            _promiseCache = new CompletionPromiseCache(logger, pwshPool.GetPoolReader(), pwshPool, frecencyStore);
+            _commandHistory = commandHistory ?? throw new ArgumentNullException(nameof(commandHistory));
 
             // Initialize Ollama service for AI completions
             _ollamaService = new OllamaService(logger);
+
+            // Initialize promise cache with PowerShell pool, FrecencyStore, CommandHistory, and OllamaService
+            _promiseCache = new CompletionPromiseCache(logger, pwshPool.GetPoolReader(), pwshPool, frecencyStore, commandHistory, _ollamaService);
 
             _logger.LogInfo("FastCompletionStore initialized with FrecencyStore backend");
         }
@@ -54,9 +56,9 @@ namespace PowerAuger
             if (ast == null)
                 return new List<string>();
 
-            // Get AST-validated completions only
             try
             {
+                // Try to get Ollama-enhanced completions
                 var commandCompletion = await _promiseCache.GetCompletionFromAstAsync(ast, tokens, cursorPosition);
 
                 if (commandCompletion?.CompletionMatches != null && commandCompletion.CompletionMatches.Count > 0)
@@ -67,22 +69,86 @@ namespace PowerAuger
                         .Take(maxResults)
                         .ToList();
 
-                    // Add validated results to FrecencyStore with high priority
+                    // Add validated Ollama results to FrecencyStore with high priority
                     foreach (var result in validatedResults)
                     {
-                        _frecencyStore.AddCommand(result, 5.0f); // High initial rank for validated completions
+                        _frecencyStore.AddCommand(result, 5.0f); // High initial rank for AI completions
                     }
 
+                    _logger.LogDebug($"Returning {validatedResults.Count} Ollama completions");
                     return validatedResults;
+                }
+
+                // Ollama returned null - fall back to PowerShell native completions
+                // Get native completions without Ollama
+                var nativeCompletion = await GetNativeCompletionsAsync(ast, tokens, cursorPosition);
+
+                if (nativeCompletion?.CompletionMatches != null && nativeCompletion.CompletionMatches.Count > 0)
+                {
+                    // Don't validate native completions - trust PowerShell
+                    // Just take top results ordered by frecency if we have history
+                    var results = nativeCompletion.CompletionMatches
+                        .OrderByDescending(m => _frecencyStore.GetScore(m.CompletionText))
+                        .Take(maxResults)
+                        .Select(m => m.CompletionText)
+                        .ToList();
+
+                    // Add to cache with normal priority (not AI-enhanced)
+                    foreach (var result in results)
+                    {
+                        _frecencyStore.AddCommand(result, 2.0f); // Normal priority for native completions
+                    }
+
+                    _logger.LogDebug($"Returning {results.Count} native completions (Ollama unavailable)");
+                    return results;
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning($"AST completion failed: {ex.Message}");
+                _logger.LogWarning($"Completion pipeline failed: {ex.Message}");
             }
 
-            // No fallback - only return validated completions
+            // No completions available
             return new List<string>();
+        }
+
+        /// <summary>
+        /// Get native PowerShell completions without Ollama
+        /// </summary>
+        private async Task<CommandCompletion?> GetNativeCompletionsAsync(
+            Ast ast,
+            Token[] tokens,
+            IScriptPosition cursorPosition)
+        {
+            PowerShell? pwsh = null;
+            try
+            {
+                // Check out PowerShell instance from pool
+                var poolReader = _pwshPool.GetPoolReader();
+                pwsh = await poolReader.ReadAsync();
+
+                // Get native PowerShell completions
+                var completion = CommandCompletion.CompleteInput(
+                    ast,
+                    tokens,
+                    cursorPosition,
+                    new Hashtable(),
+                    pwsh);
+
+                return completion;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Failed to get native completions: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (pwsh != null)
+                {
+                    _pwshPool.CheckIn(pwsh);
+                }
+            }
         }
 
         /// <summary>
@@ -170,14 +236,18 @@ namespace PowerAuger
             private readonly ChannelReader<PowerShell> _pwshPoolReader;
             private readonly BackgroundProcessor _pwshPool;
             private readonly FrecencyStore _frecencyStore;
+            private readonly CommandHistoryStore _commandHistory;
+            private readonly OllamaService _ollamaService;
             private readonly FastLogger _logger;
 
-            public CompletionPromiseCache(FastLogger logger, ChannelReader<PowerShell> pwshPoolReader, BackgroundProcessor pwshPool, FrecencyStore frecencyStore)
+            public CompletionPromiseCache(FastLogger logger, ChannelReader<PowerShell> pwshPoolReader, BackgroundProcessor pwshPool, FrecencyStore frecencyStore, CommandHistoryStore commandHistory, OllamaService ollamaService)
             {
                 _logger = logger;
                 _pwshPoolReader = pwshPoolReader;
                 _pwshPool = pwshPool;
                 _frecencyStore = frecencyStore;
+                _commandHistory = commandHistory;
+                _ollamaService = ollamaService;
                 _promises = new ConcurrentDictionary<string, AsyncLazy<CommandCompletion?>>();
             }
 
@@ -206,10 +276,83 @@ namespace PowerAuger
                                 new Hashtable(),        // Options
                                 pwsh);                  // PowerShell instance from pool
 
-                            // Validate completions using AST analysis
-                            var validated = ValidateCompletions(completion, pwsh);
+                            // Extract input string from AST up to cursor position
+                            var input = ast.Extent.Text;
+                            if (cursorPosition.Offset <= input.Length)
+                            {
+                                input = input.Substring(0, cursorPosition.Offset);
+                            }
 
-                            return validated;
+                            // Get recent unfiltered history (for context - what user is doing)
+                            var recentHistory = _commandHistory.GetRecentCommands(10);
+
+                            // Get relevant filtered examples (for patterns - what should be suggested)
+                            var relevantExamples = _frecencyStore.GetTopCommands(input.Trim(), 5);
+
+                            // Combine for current API (TODO: update to use separate params)
+                            var combinedHistory = new List<string>();
+                            combinedHistory.AddRange(recentHistory);
+                            combinedHistory.AddRange(relevantExamples);
+
+                            // Call Ollama with the PowerShell completions as context
+                            string? ollamaResult = null;
+                            try
+                            {
+                                _logger.LogDebug($"Calling Ollama with {recentHistory.Count} recent + {relevantExamples.Count} relevant examples");
+                                ollamaResult = await _ollamaService.GetCompletionAsync(
+                                    input,
+                                    completion,  // Pass the rich CommandCompletion with tooltips!
+                                    combinedHistory,  // Combined history (recent + relevant)
+                                    CompletionMode.Generate,
+                                    CancellationToken.None
+                                );
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning($"Ollama call failed: {ex.Message}");
+                                // Fall back to validated PowerShell completions
+                            }
+
+                            // If Ollama provided a suggestion, validate and use it
+                            if (!string.IsNullOrEmpty(ollamaResult))
+                            {
+                                // Create a CommandCompletion from Ollama's result
+                                var ollamaCompletionResult = new CompletionResult(
+                                    ollamaResult,
+                                    ollamaResult,
+                                    CompletionResultType.Command,
+                                    "AI suggestion from Ollama"
+                                );
+
+                                var ollamaCompletion = new CommandCompletion(
+                                    new System.Collections.ObjectModel.Collection<CompletionResult> { ollamaCompletionResult },
+                                    0, // currentMatchIndex
+                                    cursorPosition.Offset,
+                                    ollamaResult.Length
+                                );
+
+                                // Validate using existing method
+                                var validatedOllama = ValidateCompletions(ollamaCompletion, pwsh);
+                                if (validatedOllama != null && validatedOllama.CompletionMatches.Count > 0)
+                                {
+                                    _logger.LogDebug($"Using validated Ollama suggestion: {ollamaResult}");
+                                    return validatedOllama;
+                                }
+                                else
+                                {
+                                    _logger.LogDebug($"Ollama suggestion failed validation: {ollamaResult}");
+                                }
+                            }
+
+                            // IMPORTANT: We intentionally return null when Ollama fails/invalid
+                            // This signals to the caller that no AI-enhanced completion is available
+                            // The caller should then use fallback strategies (cache, native completions, etc.)
+                            // We do NOT return PowerShell's native completions here because:
+                            // 1. The caller may have better fallback options (frecency cache, etc.)
+                            // 2. This keeps the Ollama pipeline separate from fallback logic
+                            // 3. The caller can decide whether to use native, cached, or other completions
+                            _logger.LogInfo("Returning null - no Ollama completion available, caller should use fallback");
+                            return null;
                         }
                         catch (Exception ex)
                         {

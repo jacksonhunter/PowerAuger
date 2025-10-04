@@ -16,7 +16,6 @@ namespace PowerAuger
     {
         private readonly Dictionary<int, CommandEntry> _commands = new();
         private readonly FrecencyTrie _trie = new();
-        private readonly ConcurrentDictionary<string, Task<List<string>>> _pendingEnrichments = new();
         private readonly BackgroundProcessor _pwshPool;
         private readonly FastLogger _logger;
         private readonly Timer _persistenceTimer;
@@ -145,6 +144,23 @@ namespace PowerAuger
                 .ToList();
 
             return sorted;
+        }
+
+        /// <summary>
+        /// Get the frecency score for a specific command
+        /// </summary>
+        public float GetScore(string command)
+        {
+            if (string.IsNullOrEmpty(command))
+                return 0f;
+
+            command = NormalizeCommand(command);
+
+            // Find the command entry by its command string
+            var entry = _commands.Values.FirstOrDefault(c =>
+                c.Command.Equals(command, StringComparison.OrdinalIgnoreCase));
+
+            return entry?.GetFrecency() ?? 0f;
         }
 
         /// <summary>

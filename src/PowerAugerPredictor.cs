@@ -23,6 +23,7 @@ namespace PowerAuger
 
         private readonly BackgroundProcessor _pwshPool;
         private readonly FrecencyStore _frecencyStore;
+        private readonly CommandHistoryStore _commandHistory;
         private readonly FastCompletionStore _completionStore;
         private readonly OllamaService _ollamaService;
         private readonly FastLogger _logger;
@@ -42,8 +43,23 @@ namespace PowerAuger
             _frecencyStore = new FrecencyStore(_logger, _pwshPool);
             _frecencyStore.Initialize();
 
+            // Create unfiltered command history store
+            _logger.LogInfo("Initializing CommandHistoryStore");
+            _commandHistory = new CommandHistoryStore(_logger);
+
+            // Load PSReadLine history using a PowerShell instance from the pool
+            var ps = _pwshPool.CheckoutPowerShell();
+            try
+            {
+                _commandHistory.LoadFromPSReadLine(ps);
+            }
+            finally
+            {
+                _pwshPool.ReturnPowerShell(ps);
+            }
+
             // Create completion store for AST validation and Ollama integration
-            _completionStore = new FastCompletionStore(_logger, _pwshPool, _frecencyStore);
+            _completionStore = new FastCompletionStore(_logger, _pwshPool, _frecencyStore, _commandHistory);
 
             // Create Ollama service for AI completions
             _ollamaService = new OllamaService(_logger);
@@ -95,6 +111,30 @@ namespace PowerAuger
                             $"Cached: {result}"));
                     }
 
+                    // Trigger background Ollama enrichment for future requests
+                    // Fire-and-forget - don't wait for it, user gets cached results immediately
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            Token[]? bgTokens = null;
+                            ParseError[]? bgErrors = null;
+                            var bgAst = Parser.ParseInput(input, out bgTokens, out bgErrors);
+
+                            if (bgErrors?.Length == 0 && bgTokens != null)
+                            {
+                                _logger.LogDebug("Cache hit - triggering background Ollama enrichment");
+                                // This will call Ollama and update FrecencyStore with AI suggestions
+                                await _completionStore.GetCompletionsFromAstAsync(bgAst, bgTokens, cursorPosition, 3);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug($"Background enrichment failed: {ex.Message}");
+                            // Swallow exceptions - this is best-effort enrichment
+                        }
+                    });
+
                     return new SuggestionPackage(suggestions);
                 }
 
@@ -136,9 +176,9 @@ namespace PowerAuger
 
                     _pendingCompletions[asyncKey] = completionTask;
 
-                    _ = completionTask.ContinueWith(t =>
+                    _ = completionTask.ContinueWith(async t =>
                     {
-                        Thread.Sleep(1000);
+                        await Task.Delay(1000);
                         _pendingCompletions.TryRemove(asyncKey, out _);
                     });
                 }
@@ -171,7 +211,10 @@ namespace PowerAuger
         {
             try
             {
-                // Both stores handle this
+                // Record to unfiltered history (no validation)
+                _commandHistory.RecordCommand(commandLine);
+
+                // Record to frecency store (validated commands only)
                 _frecencyStore.IncrementRank(commandLine, 3.0f);
                 _completionStore.RecordExecution(commandLine);
             }

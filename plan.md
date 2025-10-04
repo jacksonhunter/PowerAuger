@@ -176,9 +176,14 @@ private Dictionary<string, PowerTypeDictionary> _dictionaries;
 
 🚀 Feature #4: Progressive Enhancement Pipeline
 
-Combining All Techniques:
+Combining All Techniques with PROPER SEPARATION:
 public class UnifiedCompletionPipeline
 {
+// IMPORTANT: Keep Ollama enhancement separate from fallback logic!
+// - Ollama pipeline should ONLY return validated AI completions or null
+// - Fallback to native completions happens at the FastCompletionStore level
+// - Don't cache fallback results as if they were AI-enhanced
+
 // Layer 0: Frecency-based instant results (zsh-z inspired)
 public List<string> GetInstantCompletions(string input)
 {
@@ -203,18 +208,42 @@ return frecent;  // 0ms - from memory
           return null;
       }
 
-      // Layer 2: AST-validated TabExpansion2 (current PowerAuger)
-      public async Task<CommandCompletion> GetAstCompletions(
+      // Layer 2: Ollama AI Enhancement (when available)
+      public async Task<CommandCompletion?> GetOllamaEnhancedCompletions(
           Ast ast, Token[] tokens, IScriptPosition position)
       {
-          // Skip if command name (CompletionPredictor optimization)
-          if (tokens[position.Offset].TokenFlags.HasFlag(TokenFlags.CommandName))
-              return GetCachedCommands();
-
+          // Try Ollama with PowerShell completions as context
+          // Returns null if Ollama unavailable/fails/invalid
           return await _promiseCache.GetCompletionFromAstAsync(ast, tokens, position);
       }
 
-      // Layer 3: Smart file fallback (DirectoryPredictor patterns)
+      // Layer 3: Native PowerShell Fallback (when Ollama unavailable)
+      public async Task<List<string>> GetNativeFallback(
+          Ast ast, Token[] tokens, IScriptPosition position)
+      {
+          // Get native PowerShell completions WITHOUT validation
+          // Trust PowerShell's built-in logic
+          var nativeCompletions = await GetNativeCompletionsAsync(ast, tokens, position);
+
+          if (nativeCompletions?.CompletionMatches != null)
+          {
+              // CURRENT: Order by frecency score if we have history
+              // FUTURE: Experiment with richer enrichment options:
+              //   - Add usage context to tooltips
+              //   - Combine with command dictionaries
+              //   - Apply command-specific sorting rules
+              //   - Must maintain <20ms response time
+              return nativeCompletions.CompletionMatches
+                  .OrderByDescending(m => _frecencyStore.GetScore(m.CompletionText))
+                  .Take(3)
+                  .Select(m => m.CompletionText)
+                  .ToList();
+          }
+
+          return new List<string>();
+      }
+
+      // Layer 4: Smart file fallback (DirectoryPredictor patterns)
       public async Task<List<string>> GetFileFallback(string command, string prefix)
       {
           // Use DirectoryPredictor OR patterns
@@ -292,3 +321,42 @@ This creates a completion system that:
 3. Validates suggestions (AST)
 4. Never blocks (async everything)
 5. Gets faster over time (caching + learning)
+
+---
+
+## Next Implementation Priorities
+
+### 1. Dual Model Architecture
+Implement separate model handling for different completion modes:
+- **FIM Model** (qwen2.5-0.5B-autocomplete-custom): Fast, lightweight for Generate mode
+- **Chat Model** (Qwen3-Coder-30b-v0.2-custom): More powerful for Chat mode with context
+- Allow independent configuration and fallback strategies per model
+- Track circuit breaker state separately for each model
+
+### 2. Ollama Retry with Validation
+Add retry logic when Ollama returns invalid completions:
+- First attempt: Generate mode (fast FIM model)
+- If validation fails: Retry with Chat mode (powerful context-aware model)
+- If Chat mode fails: Fall back to native PowerShell completions
+- Track validation failure reasons for debugging
+- Add metrics to measure which mode succeeds most often
+
+### 3. Warmup Mode Implementation
+Proactive command prediction when prompt is empty:
+- Use `GetNextCommandPredictionAsync` from OllamaService
+- Leverage CommandHistoryStore for recent command sequences
+- Show predicted next command as inline suggestion
+- Triggered when:
+  - User just executed a command
+  - Prompt is empty or contains only whitespace
+  - Part of a recognized workflow pattern
+- Benefits:
+  - Zero-latency suggestions for repetitive workflows
+  - Learn common command sequences (git add -> git commit -> git push)
+  - Preload AI model during idle time
+
+**Implementation Notes:**
+- Warmup should be non-blocking and low priority
+- Cache predictions to avoid repeated AI calls for same sequences
+- Integrate with CommandHistoryStore's `GetSequencesEndingWith` and `GetCommandSequences`
+- Consider time-of-day patterns (morning: git pull, evening: git push)
