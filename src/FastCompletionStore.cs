@@ -251,6 +251,67 @@ namespace PowerAuger
                 _promises = new ConcurrentDictionary<string, AsyncLazy<CommandCompletion?>>();
             }
 
+            private async Task<string?[]> GetParallelOllamaCompletionsAsync(
+                string input,
+                CommandCompletion? tabCompletions,
+                List<string> history)
+            {
+                _logger.LogDebug("Starting parallel Ollama calls (Generate + Chat)");
+
+                var generateTask = _ollamaService.GetCompletionAsync(
+                    input, tabCompletions, history,
+                    CompletionMode.Generate, CancellationToken.None);
+
+                var chatTask = _ollamaService.GetCompletionAsync(
+                    input, tabCompletions, history,
+                    CompletionMode.Chat, CancellationToken.None);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var results = await Task.WhenAll(generateTask, chatTask);
+                sw.Stop();
+
+                var successCount = results.Count(r => !string.IsNullOrEmpty(r));
+                _logger.LogDebug($"Ollama calls completed in {sw.ElapsedMilliseconds}ms ({successCount}/{results.Length} succeeded)");
+
+                return results;
+            }
+
+            private CommandCompletion? BuildOllamaCompletion(
+                string?[] ollamaResults,
+                CommandCompletion? tabCompletions,
+                IScriptPosition cursorPosition)
+            {
+                var allMatches = ollamaResults
+                    .Select((result, index) => new { result, mode = index == 0 ? "Generate" : "Chat" })
+                    .Where(x => !string.IsNullOrEmpty(x.result))
+                    .Select(x =>
+                    {
+                        var matchingTab = tabCompletions?.CompletionMatches
+                            ?.FirstOrDefault(m => m.CompletionText.Equals(x.result,
+                                StringComparison.OrdinalIgnoreCase));
+
+                        var tooltip = matchingTab?.ToolTip ??
+                            $"AI suggestion from Ollama ({x.mode} mode)";
+
+                        return new CompletionResult(
+                            x.result, x.result,
+                            CompletionResultType.Command, tooltip);
+                    })
+                    .ToList();
+
+                if (allMatches.Count == 0)
+                {
+                    _logger.LogDebug("No valid Ollama results returned");
+                    return null;
+                }
+
+                _logger.LogInfo($"Built CommandCompletion from {allMatches.Count} Ollama suggestions");
+
+                return new CommandCompletion(
+                    new System.Collections.ObjectModel.Collection<CompletionResult>(allMatches),
+                    0, cursorPosition.Offset, allMatches[0].CompletionText.Length);
+            }
+
             public Task<CommandCompletion?> GetCompletionFromAstAsync(
                 Ast ast,
                 Token[] tokens,
@@ -289,69 +350,40 @@ namespace PowerAuger
                             // Get relevant filtered examples (for patterns - what should be suggested)
                             var relevantExamples = _frecencyStore.GetTopCommands(input.Trim(), 5);
 
-                            // Combine for current API (TODO: update to use separate params)
+                            // Combine for current API
                             var combinedHistory = new List<string>();
                             combinedHistory.AddRange(recentHistory);
                             combinedHistory.AddRange(relevantExamples);
 
-                            // Call Ollama with the PowerShell completions as context
-                            string? ollamaResult = null;
-                            try
+                            // Call BOTH Ollama modes in parallel (Generate + Chat)
+                            _logger.LogDebug($"Calling Ollama with {recentHistory.Count} recent + {relevantExamples.Count} relevant examples");
+
+                            var ollamaResults = await GetParallelOllamaCompletionsAsync(
+                                input, completion, combinedHistory);
+
+                            // Build CommandCompletion from all Ollama results
+                            var ollamaCompletion = BuildOllamaCompletion(
+                                ollamaResults, completion, cursorPosition);
+
+                            if (ollamaCompletion == null)
                             {
-                                _logger.LogDebug($"Calling Ollama with {recentHistory.Count} recent + {relevantExamples.Count} relevant examples");
-                                ollamaResult = await _ollamaService.GetCompletionAsync(
-                                    input,
-                                    completion,  // Pass the rich CommandCompletion with tooltips!
-                                    combinedHistory,  // Combined history (recent + relevant)
-                                    CompletionMode.Generate,
-                                    CancellationToken.None
-                                );
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning($"Ollama call failed: {ex.Message}");
-                                // Fall back to validated PowerShell completions
+                                _logger.LogInfo("No Ollama results returned, caller should use fallback");
+                                return null;
                             }
 
-                            // If Ollama provided a suggestion, validate and use it
-                            if (!string.IsNullOrEmpty(ollamaResult))
+                            // Validate all Ollama suggestions (sequential using same pwsh)
+                            var validatedOllama = ValidateCompletions(ollamaCompletion, pwsh);
+
+                            if (validatedOllama?.CompletionMatches?.Count > 0)
                             {
-                                // Create a CommandCompletion from Ollama's result
-                                var ollamaCompletionResult = new CompletionResult(
-                                    ollamaResult,
-                                    ollamaResult,
-                                    CompletionResultType.Command,
-                                    "AI suggestion from Ollama"
-                                );
-
-                                var ollamaCompletion = new CommandCompletion(
-                                    new System.Collections.ObjectModel.Collection<CompletionResult> { ollamaCompletionResult },
-                                    0, // currentMatchIndex
-                                    cursorPosition.Offset,
-                                    ollamaResult.Length
-                                );
-
-                                // Validate using existing method
-                                var validatedOllama = ValidateCompletions(ollamaCompletion, pwsh);
-                                if (validatedOllama != null && validatedOllama.CompletionMatches.Count > 0)
-                                {
-                                    _logger.LogDebug($"Using validated Ollama suggestion: {ollamaResult}");
-                                    return validatedOllama;
-                                }
-                                else
-                                {
-                                    _logger.LogDebug($"Ollama suggestion failed validation: {ollamaResult}");
-                                }
+                                _logger.LogDebug($"Returning {validatedOllama.CompletionMatches.Count} validated Ollama suggestions");
+                                return validatedOllama;
                             }
 
                             // IMPORTANT: We intentionally return null when Ollama fails/invalid
                             // This signals to the caller that no AI-enhanced completion is available
                             // The caller should then use fallback strategies (cache, native completions, etc.)
-                            // We do NOT return PowerShell's native completions here because:
-                            // 1. The caller may have better fallback options (frecency cache, etc.)
-                            // 2. This keeps the Ollama pipeline separate from fallback logic
-                            // 3. The caller can decide whether to use native, cached, or other completions
-                            _logger.LogInfo("Returning null - no Ollama completion available, caller should use fallback");
+                            _logger.LogInfo("All Ollama suggestions failed validation, caller should use fallback");
                             return null;
                         }
                         catch (Exception ex)
