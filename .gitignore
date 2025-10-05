@@ -38,3 +38,6 @@ ehthumbs.db
 *.tmp
 *.temp
 ~$*
+
+# Claude Code settings
+.claude/

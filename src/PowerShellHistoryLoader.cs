@@ -12,6 +12,152 @@ namespace PowerAuger
     /// </summary>
     public static class PowerShellHistoryLoader
     {
+                /// <summary>
+        /// Load command history with metadata (for CommandHistoryStore)
+        /// Returns entries with command text and timestamp (pwd/success/astType added later)
+        /// </summary>
+        public static List<PowerAuger.CommandHistoryEntry> LoadHistoryWithMetadata(int maxSize = 4096, FastLogger? logger = null)
+        {
+            var entries = new List<PowerAuger.CommandHistoryEntry>();
+
+            try
+            {
+                var historyPath = GetHistoryPath();
+
+                if (!File.Exists(historyPath))
+                {
+                    logger?.LogWarning($"History file not found: {historyPath}");
+                    return entries;
+                }
+
+                var lines = File.ReadAllLines(historyPath);
+                logger?.LogInfo($"Loading {lines.Length} history lines from {historyPath}");
+
+                var commands = new List<string>();
+                int multilineCount = 0;
+ 
+                // Handle multiline commands with backtick continuation AND here-strings
+                var currentCommand = new System.Text.StringBuilder();
+                bool inHereString = false;
+                string? hereStringDelimiter = null;
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    var line = lines[i];
+
+                    // If we're in a here-string, accumulate until we hit the closing delimiter
+                    if (inHereString)
+                    {
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
+
+                        // Check if this line is the here-string end delimiter
+                        if (line.TrimStart() == hereStringDelimiter || line.TrimStart().StartsWith(hereStringDelimiter + "`"))
+                        {
+                            inHereString = false;
+                            hereStringDelimiter = null;
+
+                            // Check if the delimiter line has a backtick continuation
+                            if (line.TrimEnd().EndsWith("`"))
+                            {
+                                // Command continues after here-string
+                                continue;
+                            }
+                            else
+                            {
+                                // Here-string ends the command
+                                var fullCommand = currentCommand.ToString().Trim();
+                                commands.Add(fullCommand);
+                                currentCommand.Clear();
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Skip empty lines
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        // If we have a command built up, process it
+                        if (currentCommand.Length > 0)
+                        {
+                            var fullCommand = currentCommand.ToString().Trim();
+                            commands.Add(fullCommand);
+                            currentCommand.Clear();
+                        }
+                        continue;
+                    }
+
+                    // Check if this line starts a here-string
+                    if (line.TrimStart().StartsWith("@'") || line.TrimStart().StartsWith("@\""))
+                    {
+                        inHereString = true;
+                        hereStringDelimiter = line.TrimStart().StartsWith("@'") ? "'@" : "\"@";
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
+                        continue;
+                    }
+
+                    // Check if this is a continuation line (ends with backtick)
+                    if (line.EndsWith("`"))
+                    {
+                        // Remove the backtick and add to current command
+                        currentCommand.AppendLine(line.Substring(0, line.Length - 1));
+                        multilineCount++;
+                    }
+                    else if (currentCommand.Length > 0)
+                    {
+                        // This is the last line of a multiline command
+                        currentCommand.AppendLine(line);
+                        var fullCommand = currentCommand.ToString().Trim();
+                        commands.Add(fullCommand);
+                        currentCommand.Clear();
+                    }
+                    else
+                    {
+                        // Single line command
+                        commands.Add(line);
+                    }
+                }
+
+                // Don't forget the last command if it exists
+                if (currentCommand.Length > 0)
+                {
+                    var fullCommand = currentCommand.ToString().Trim();
+                    commands.Add(fullCommand);
+                }
+
+                logger?.LogInfo($"Parsed {commands.Count} commands from {lines.Length} lines (multiline: {multilineCount})");
+
+                // Apply maxSize limit to combined commands
+
+                var limitedCommands = commands.ToList();
+
+                // Convert to CommandHistoryEntry objects
+                for (int i = 0; i < limitedCommands.Count; i++)
+                {
+                    ScriptBlockAst ast = Parser.ParseInput(limitedCommands[i], out _, out _);
+                    string astType = ast?.EndBlock?.Statements?.FirstOrDefault()?.GetType()?.Name;
+                    
+                    var entry = new PowerAuger.CommandHistoryEntry(
+                        Command: limitedCommands[i],
+                        WorkingDirectory: null,
+                        Timestamp: null,
+                        Success: null, 
+                        AstType: astType 
+                    );
+                    entries.Add(entry);
+                }
+
+                logger?.LogInfo($"Loaded {entries.Count} command history entries (max: {maxSize})");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError($"Failed to load history with metadata: {ex.Message}");
+            }
+
+            return entries;
+        }
+
         /// <summary>
         /// Load and validate PowerShell command history with frequency counting
         /// </summary>
@@ -24,7 +170,7 @@ namespace PowerAuger
                 var historyPath = GetHistoryPath();
 
                 if (!File.Exists(historyPath))
-                {
+                { 
                     logger?.LogWarning($"History file not found: {historyPath}");
                     return commandFrequencies;
                 }
@@ -36,14 +182,46 @@ namespace PowerAuger
                 int parseErrorCount = 0;
                 int multilineCount = 0;
 
-                // Handle multiline commands with backtick continuation
+                // Handle multiline commands with backtick continuation AND here-strings
                 var currentCommand = new System.Text.StringBuilder();
+                bool inHereString = false;
+                string? hereStringDelimiter = null;
 
                 for (int i = 0; i < lines.Length; i++)
                 {
                     var line = lines[i];
 
-                    // Skip empty lines and comments
+                    // If we're in a here-string, accumulate until we hit the closing delimiter
+                    if (inHereString)
+                    {
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
+
+                        // Check if this line is the here-string end delimiter
+                        if (line.TrimStart() == hereStringDelimiter || line.TrimStart().StartsWith(hereStringDelimiter + "`"))
+                        {
+                            inHereString = false;
+                            hereStringDelimiter = null;
+
+                            // Check if the delimiter line has a backtick continuation
+                            if (line.TrimEnd().EndsWith("`"))
+                            {
+                                // Command continues after here-string
+                                continue;
+                            }
+                            else
+                            {
+                                // Here-string ends the command
+                                var fullCommand = currentCommand.ToString().Trim();
+                                ProcessCommandForFrequency(fullCommand, commandFrequencies,
+                                    ref filteredCount, ref parseErrorCount, logger);
+                                currentCommand.Clear();
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Skip empty lines and comments (but only when not building a command)
                     if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#"))
                     {
                         // If we have a command built up, process it
@@ -54,6 +232,16 @@ namespace PowerAuger
                                 ref filteredCount, ref parseErrorCount, logger);
                             currentCommand.Clear();
                         }
+                        continue;
+                    }
+
+                    // Check if this line starts a here-string
+                    if (line.TrimStart().StartsWith("@'") || line.TrimStart().StartsWith("@\""))
+                    {
+                        inHereString = true;
+                        hereStringDelimiter = line.TrimStart().StartsWith("@'") ? "'@" : "\"@";
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
                         continue;
                     }
 
@@ -229,14 +417,46 @@ namespace PowerAuger
                 int parseErrorCount = 0;
                 int multilineCount = 0;
 
-                // Handle multiline commands with backtick continuation
+                // Handle multiline commands with backtick continuation AND here-strings
                 var currentCommand = new System.Text.StringBuilder();
+                bool inHereString = false;
+                string? hereStringDelimiter = null;
 
                 for (int i = 0; i < lines.Length; i++)
                 {
                     var line = lines[i];
 
-                    // Skip empty lines and comments
+                    // If we're in a here-string, accumulate until we hit the closing delimiter
+                    if (inHereString)
+                    {
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
+
+                        // Check if this line is the here-string end delimiter
+                        if (line.TrimStart() == hereStringDelimiter || line.TrimStart().StartsWith(hereStringDelimiter + "`"))
+                        {
+                            inHereString = false;
+                            hereStringDelimiter = null;
+
+                            // Check if the delimiter line has a backtick continuation
+                            if (line.TrimEnd().EndsWith("`"))
+                            {
+                                // Command continues after here-string
+                                continue;
+                            }
+                            else
+                            {
+                                // Here-string ends the command
+                                var fullCommand = currentCommand.ToString().Trim();
+                                ProcessCommand(fullCommand, uniqueCommands, validated,
+                                    ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
+                                currentCommand.Clear();
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Skip empty lines and comments (but only when not building a command)
                     if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#"))
                     {
                         // If we have a command built up, process it
@@ -247,6 +467,16 @@ namespace PowerAuger
                                 ref filteredCount, ref duplicateCount, ref parseErrorCount, logger);
                             currentCommand.Clear();
                         }
+                        continue;
+                    }
+
+                    // Check if this line starts a here-string
+                    if (line.TrimStart().StartsWith("@'") || line.TrimStart().StartsWith("@\""))
+                    {
+                        inHereString = true;
+                        hereStringDelimiter = line.TrimStart().StartsWith("@'") ? "'@" : "\"@";
+                        currentCommand.AppendLine(line);
+                        multilineCount++;
                         continue;
                     }
 
@@ -448,5 +678,31 @@ namespace PowerAuger
             return psReadLinePath;
         }
 
+        /// <summary>
+        /// Get the maximum history count from PSReadLineOption
+        /// </summary>
+        public static int GetMaximumHistoryCount(FastLogger? logger = null)
+        {
+            try
+            {
+                using var ps = PowerShell.Create();
+                ps.AddScript("(Get-PSReadLineOption).MaximumHistoryCount");
+                var results = ps.Invoke();
+
+                if (results?.Count > 0 && int.TryParse(results[0]?.ToString(), out int maxHistory))
+                {
+                    logger?.LogInfo($"Retrieved MaximumHistoryCount from PSReadLine: {maxHistory}");
+                    return maxHistory;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError($"Failed to get MaximumHistoryCount: {ex.Message}");
+            }
+
+            // Default to 4096 if unable to retrieve
+            logger?.LogInfo("Using default MaximumHistoryCount: 4096");
+            return 4096;
+        }
     }
 }

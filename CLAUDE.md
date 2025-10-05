@@ -25,6 +25,15 @@ PSReadLine → PowerAugerPredictor → FastCompletionStore → FrecencyStore
 
 ## Key Components
 
+### CommandHistoryStore
+- **Unfiltered command history** with rich metadata tracking
+- Persistent JSON storage at `%LOCALAPPDATA%\PowerAuger\command-history.json`
+- Records: command text, working directory, timestamp, success status, AST type
+- Automatically loads from PSReadLine history file on first run
+- Supports here-string parsing and multiline commands
+- Used for context and sequence analysis (not for completions)
+- Default max size: 10,000 entries
+
 ### FrecencyStore
 - **Primary storage** with zsh-z frecency algorithm
 - Combines frequency + recency for intelligent ranking

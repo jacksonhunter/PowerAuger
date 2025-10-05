@@ -84,6 +84,9 @@ function Enable-PowerAuger {
         Set-PSReadLineOption -PredictionSource HistoryAndPlugin
         Set-PSReadLineOption -PredictionViewStyle ListView
 
+        # Set keybinding for AcceptNextSuggestionWord
+        Set-PSReadLineKeyHandler -Chord "Ctrl+Alt+RightArrow" -Function ForwardWord
+
         $script:IsEnabled = $true
         Write-Host "PowerAuger predictor enabled successfully!" -ForegroundColor Green
         Write-Host "Predictor ID: $($script:PredictorInstance.Id)" -ForegroundColor DarkGray
@@ -244,6 +247,9 @@ $registerPredictor = {
         # Configure PSReadLine
         Set-PSReadLineOption -PredictionSource HistoryAndPlugin -ErrorAction SilentlyContinue
         Set-PSReadLineOption -PredictionViewStyle ListView -ErrorAction SilentlyContinue
+
+        # Set keybinding for AcceptNextSuggestionWord
+        Set-PSReadLineKeyHandler -Chord "Ctrl+Alt+RightArrow" -Function ForwardWord -ErrorAction SilentlyContinue
 
         $script:IsEnabled = $true
         Write-Host "PowerAuger: [OK] Predictor registered successfully!" -ForegroundColor Green

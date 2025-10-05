@@ -43,20 +43,9 @@ namespace PowerAuger
             _frecencyStore = new FrecencyStore(_logger, _pwshPool);
             _frecencyStore.Initialize();
 
-            // Create unfiltered command history store
+            // Create unfiltered command history store (loads from JSON or PSReadLine history file)
             _logger.LogInfo("Initializing CommandHistoryStore");
             _commandHistory = new CommandHistoryStore(_logger);
-
-            // Load PSReadLine history using a PowerShell instance from the pool
-            var ps = _pwshPool.CheckoutPowerShell();
-            try
-            {
-                _commandHistory.LoadFromPSReadLine(ps);
-            }
-            finally
-            {
-                _pwshPool.ReturnPowerShell(ps);
-            }
 
             // Create completion store for AST validation and Ollama integration
             _completionStore = new FastCompletionStore(_logger, _pwshPool, _frecencyStore, _commandHistory);
@@ -207,12 +196,38 @@ namespace PowerAuger
             }
         }
 
-        public void OnCommandLineExecuted(string commandLine)
+        public void OnCommandLineExecuted(PredictionClient client, string commandLine, bool success)
         {
             try
             {
-                // Record to unfiltered history (no validation)
-                _commandHistory.RecordCommand(commandLine);
+                // Extract working directory
+                var workingDirectory = Environment.CurrentDirectory;
+
+                // Parse AST to get type
+                string? astType = null;
+                try
+                {
+                    Token[] tokens;
+                    ParseError[] errors;
+                    var ast = Parser.ParseInput(commandLine, out tokens, out errors);
+
+                    if (errors == null || errors.Length == 0)
+                    {
+                        // Get the primary AST type
+                        var firstStatement = ast?.EndBlock?.Statements?.FirstOrDefault();
+                        if (firstStatement != null)
+                        {
+                            astType = firstStatement.GetType().Name;
+                        }
+                    }
+                }
+                catch
+                {
+                    // If AST parsing fails, continue without AST type
+                }
+
+                // Record to unfiltered history with full metadata
+                _commandHistory.RecordCommand(commandLine, workingDirectory, success, astType);
 
                 // Record to frecency store (validated commands only)
                 _frecencyStore.IncrementRank(commandLine, 3.0f);
