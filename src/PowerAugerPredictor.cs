@@ -232,6 +232,19 @@ namespace PowerAuger
                 // Record to frecency store (validated commands only)
                 _frecencyStore.IncrementRank(commandLine, 3.0f);
                 _completionStore.RecordExecution(commandLine);
+
+                // Trigger warmup prediction (fire and forget)
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _completionStore.TriggerWarmupPredictionAsync(commandLine);
+                    }
+                    catch (Exception warmupEx)
+                    {
+                        _logger.LogWarning($"Warmup prediction failed: {warmupEx.Message}");
+                    }
+                });
             }
             catch (Exception ex)
             {

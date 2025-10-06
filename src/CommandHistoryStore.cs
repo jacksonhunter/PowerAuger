@@ -143,19 +143,24 @@ namespace PowerAuger
                 {
                     if (_history[i].Command.Equals(endCommand, StringComparison.OrdinalIgnoreCase))
                     {
-                        // Extract sequence ending at this position
-                        var startIndex = Math.Max(0, i - sequenceLength + 1);
-                        var length = i - startIndex + 1;
-
-                        if (length >= 2) // Need at least 2 commands for a meaningful sequence
+                        // Ensure there's a command AFTER the match for warmup prediction
+                        if (i + 1 < _history.Count)
                         {
-                            var sequence = _history
-                                .Skip(startIndex)
-                                .Take(length)
-                                .Select(e => e.Command)
-                                .ToArray();
+                            // Extract: [commands before] + [match at i] + [command after at i+1]
+                            var startIndex = Math.Max(0, i - sequenceLength + 2);
+                            var endIndex = i + 1;
+                            var length = endIndex - startIndex + 1;
 
-                            sequences.Add(sequence);
+                            if (length >= 2) // Need at least 2 commands for a meaningful sequence
+                            {
+                                var sequence = _history
+                                    .Skip(startIndex)
+                                    .Take(length)
+                                    .Select(e => e.Command)
+                                    .ToArray();
+
+                                sequences.Add(sequence);
+                            }
                         }
                     }
                 }

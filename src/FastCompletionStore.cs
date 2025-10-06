@@ -219,6 +219,59 @@ namespace PowerAuger
             return spaceIndex > 0 ? commandLine.Substring(0, spaceIndex) : commandLine;
         }
 
+        /// <summary>
+        /// Trigger warmup prediction based on command execution
+        /// Predicts next command and pre-populates cache
+        /// </summary>
+        public async Task TriggerWarmupPredictionAsync(string lastCommand, CancellationToken ct = default)
+        {
+            try
+            {
+                // Get current context (last 10 commands)
+                var lastTen = _commandHistory.GetRecentCommands(10).ToArray();
+
+                if (lastTen.Length == 0)
+                {
+                    _logger.LogDebug("No command history available for warmup");
+                    return;
+                }
+
+                // Get historical sequences: [10 before match] + [match] + [what came after]
+                var sequences = _commandHistory.GetSequencesEndingWith(
+                    lastCommand,
+                    sequenceLength: 12,  // 10 context + match + after
+                    maxSequences: 3
+                );
+
+                if (sequences.Count == 0)
+                {
+                    _logger.LogDebug($"No historical sequences found for warmup (command: {lastCommand})");
+                    return;
+                }
+
+                _logger.LogDebug($"Triggering warmup with {sequences.Count} historical sequences");
+
+                // Call Ollama warmup
+                var prediction = await _ollamaService.GetNextCommandPredictionAsync(
+                    lastTen, sequences, ct);
+
+                // Pre-populate cache if valid
+                if (!string.IsNullOrEmpty(prediction))
+                {
+                    _frecencyStore.IncrementRank(prediction, 1.0f);
+                    _logger.LogInfo($"Warmup predicted next command: {prediction}");
+                }
+                else
+                {
+                    _logger.LogDebug("Warmup prediction returned null or empty");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"Warmup prediction failed: {ex.Message}");
+            }
+        }
+
         public void Dispose()
         {
             // Dispose of managed resources
